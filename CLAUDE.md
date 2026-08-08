@@ -102,6 +102,16 @@ uv run python -m continuity.data.load --days 21
   confidently wrong.
 - **Every query is recorded.** The gateway logs SQL and duration so each claim in a generated brief
   can link back to the query that produced it. This is a product feature, not debug logging.
+- **Never use `count()` on `qoe_rollup_5m`.** It is an `AggregatingMergeTree`, so a plain `count()`
+  returns however many unmerged parts happen to exist at query time — a background-merge artifact,
+  not a logical row count. It changes between identical queries. Use merge-invariant aggregates
+  instead: `sum(...)` over `SimpleAggregateFunction` columns, `uniqMerge(sessions)`,
+  `quantilesTDigestMerge(...)(startup_q)`, `avgMerge(bitrate_avg)`. These are associative and
+  therefore deterministic regardless of merge state. This applies to every drill-down query in
+  sub-project 2 — a metric built on `count()` would drift for no visible reason.
+- **Convert numpy columns with `.tolist()` before `clickhouse-connect` inserts.** It expects native
+  Python types; passing arrays fails deep inside the driver with an opaque
+  `'numpy.datetime64' object has no attribute 'timestamp'`.
 - **No secrets in code or logs.** `ClickHouseConfig.__repr__` redacts the password; keep it that way.
 - Line length 100. `ruff` governs style — do not hand-format around it.
 
