@@ -37,10 +37,30 @@ Built for the Agentic Cinema hackathon, **ClickHouse track**. Deadline **2026-09
 | Runtime DB access | `mcp-clickhouse` via `mcp` client |
 | Bulk load | `clickhouse-connect` |
 | Agent framework | `google-adk` (added in sub-project 3) |
-| Model | Gemini via Vertex AI — **pin the exact model ID by listing from the live API, never from docs** |
+| Model | `gemini-3.6-flash` via Vertex AI on the **`global`** endpoint |
 | API | FastAPI + SSE (sub-project 4) |
 | Frontend | React + Vite + Tailwind (sub-project 4) |
 | Deploy | Cloud Run, project `agentic-hackathon-504919`, region `us-central1` |
+
+### Model availability — verified against the live API, 2026-08-08
+
+`GOOGLE_CLOUD_LOCATION` must be **`global`**, not a region. Every Gemini 3.x model returns
+404 in `us-central1`; they serve only from the global endpoint. `us-central1` offers
+nothing newer than the 2.5 generation.
+
+| Model | `global` | `us-central1` |
+|---|---|---|
+| `gemini-3.6-flash` | yes | no |
+| `gemini-3.5-flash`, `gemini-3.5-flash-lite` | yes | no |
+| `gemini-flash-latest` | yes | no |
+| `gemini-2.5-pro` | yes | yes |
+| `gemini-2.5-flash` | — | yes |
+| `gemini-3.1-pro` / `3.5-pro` / `3.6-pro` | **404 — do not exist for this project** | no |
+
+There is no Gemini 3.x Pro tier here, so the design cannot assume one. Default to
+`gemini-3.6-flash`; `gemini-2.5-pro` is the only Pro-tier fallback if a stage proves too
+hard for Flash. Note the Vertex location (`global`) is independent of the Cloud Run
+deploy region (`us-central1`) — keep them as separate settings.
 
 ---
 
