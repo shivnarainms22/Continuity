@@ -10,6 +10,7 @@ tests never matters.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -31,10 +32,24 @@ _SUBSCRIBER_COUNT = 200
 
 _REPORTED_TABLES = ("playback_events", "qoe_rollup_5m", "titles", "subscribers", "change_log")
 
+# These tests truncate and reload, so they must never touch the working database.
+_TEST_DATABASE = "continuity_test"
+
 
 @pytest.fixture(scope="module")
 def config() -> ClickHouseConfig:
-    return ClickHouseConfig.from_env()
+    """Point every test in this file at a DEDICATED database.
+
+    These tests call the loader with truncate=True. Run against the working database
+    they silently destroy whatever is loaded there and replace it with a 1-day toy
+    dataset -- which is exactly what happened once: a full `pytest` run wiped a 59.8M-row
+    dataset, and the damage only surfaced later as a benchmark returning zero rows.
+
+    Isolation belongs here rather than in a convention about when it is safe to run the
+    suite, because a test suite that destroys real data is a trap that will be sprung
+    again.
+    """
+    return dataclasses.replace(ClickHouseConfig.from_env(), database=_TEST_DATABASE)
 
 
 @pytest.fixture
