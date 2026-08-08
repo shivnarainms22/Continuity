@@ -153,6 +153,27 @@ def _change_log_row_tuples(incidents: Sequence[PlantedIncident]) -> list[tuple]:
     return [tuple(row[c] for c in CHANGE_LOG_COLUMNS) for row in rows]
 
 
+def _column_values(batch: dict, column: str) -> list:
+    """Convert one generated column to values clickhouse-connect stores correctly.
+
+    Datetime columns are passed as integer epoch milliseconds, NOT as datetime objects.
+    `.tolist()` on a numpy datetime64 yields a NAIVE datetime, and clickhouse-connect
+    interprets a naive datetime as LOCAL time before converting it into a
+    DateTime64(3, 'UTC') column. On a Pacific machine that silently shifted every
+    timestamp by +8 hours, which broke alignment between the data and the incident
+    windows recorded in ground truth -- and, being derived from the host timezone, would
+    have produced a different dataset on a UTC host such as Cloud Run.
+
+    Integer epoch milliseconds are unambiguous, and the cast is a free vectorised
+    reinterpretation rather than a per-row Python conversion. Timezone-aware datetimes
+    are equally correct but would cost a Python loop over tens of millions of rows.
+    """
+    values = batch[column]
+    if values.dtype.kind == "M":
+        return values.astype("datetime64[ms]").astype("int64").tolist()
+    return values.tolist()
+
+
 def _insert(client, table: str, data: list[tuple], column_names: Sequence[str]) -> int:
     try:
         client.insert(table, data, column_names=list(column_names))
@@ -175,7 +196,7 @@ def _load_playback_events(
             # clickhouse-connect's column-oriented insert expects native Python values
             # (datetime.datetime, int, str, uuid.UUID), not numpy scalars/datetime64 --
             # .tolist() converts every column's numpy dtype to the matching native type.
-            columns = [batch[c].tolist() for c in PLAYBACK_EVENTS_COLUMNS]
+            columns = [_column_values(batch, c) for c in PLAYBACK_EVENTS_COLUMNS]
             client.insert(
                 "playback_events",
                 columns,

@@ -96,6 +96,41 @@ def test_mv_actually_fires_on_insert(config, ch_client, tmp_path):
     assert _count(ch_client, "qoe_rollup_5m") > 0
 
 
+def test_stored_timestamps_are_utc_and_not_shifted_by_the_host_timezone(
+    config, ch_client, tmp_path
+):
+    """Stored event_time must equal the generated instant exactly.
+
+    Regression guard. `.tolist()` on a numpy datetime64 yields a NAIVE datetime, and
+    clickhouse-connect interprets a naive datetime as LOCAL time before writing it into
+    a DateTime64(3, 'UTC') column. On a Pacific host that shifted every timestamp by
+    +8 hours, so the incident windows recorded in ground truth no longer pointed at the
+    events they described -- and because the offset comes from the host timezone, the
+    dataset differed between a developer laptop and a UTC host such as Cloud Run.
+
+    Asserting against a fixed expected instant rather than "close to now" is the point:
+    a timezone bug reproduces only where the offset is non-zero.
+    """
+    _run(config, tmp_path / "ground_truth.json")
+
+    lo, hi = ch_client.query(
+        "SELECT min(event_time), max(event_time) FROM playback_events"
+    ).result_rows[0]
+
+    window_start = load_module.WINDOW_START.replace(tzinfo=None)
+    offset_hours = (lo.replace(tzinfo=None) - window_start).total_seconds() / 3600
+    assert -1 < offset_hours < 1, (
+        f"earliest stored event {lo} is {offset_hours:+.1f}h from the generation window "
+        f"start {window_start}; expected under an hour. A non-zero whole-hour offset "
+        f"means naive datetimes were reinterpreted through the host timezone on insert."
+    )
+    # One day of data plus the tail of sessions that began just before midnight.
+    assert (hi.replace(tzinfo=None) - window_start).total_seconds() < 26 * 3600, (
+        f"latest stored event {hi} is more than 26h after the window start "
+        f"{window_start} for a 1-day load -- timestamps were shifted forward on insert"
+    )
+
+
 # --- truncate clears the rollup too -------------------------------------------------
 
 
