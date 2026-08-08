@@ -4,6 +4,13 @@ Synthetic series are built with a uniform robust baseline (median ~10.1, MAD ~0.
 across a 7-day trailing window with small per-day jitter, so MAD > 0 and z-scores are
 well defined. Overrides inject specific test-day bucket values to simulate blips,
 sustained incidents, and gaps.
+
+These synthetic series are shaped for `ComparisonMode.TRAILING_DAYS` (day offsets 1..7,
+not tied to weekday), so every test below that exercises `label_buckets` /
+`detect_from_series` passes `mode=ComparisonMode.TRAILING_DAYS` explicitly -- this file
+is about run-length/grouping/direction logic, not baseline-mode selection itself (see
+tests/analysis/test_baseline.py for that). `detect()`'s actual default,
+`ComparisonMode.WEEK_OVER_WEEK`, is covered separately below.
 """
 
 from __future__ import annotations
@@ -12,8 +19,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from continuity.analysis.baseline import Baseline, BaselineStatus
+from continuity.analysis.baseline import Baseline, BaselineStatus, ComparisonMode
 from continuity.analysis.detect import (
+    DEFAULT_MODE,
     BucketLabel,
     BucketStatus,
     build_series_sql,
@@ -70,7 +78,9 @@ def _series(
 
 def test_label_buckets_flags_a_sustained_deviation_as_anomalous():
     obs, start, end = _series(WINDOW_START, 6, overrides={2: 15.0, 3: 15.0, 4: 15.0})
-    labels = label_buckets(obs, start=start, end=end, metric=get_metric("rebuffer"))
+    labels = label_buckets(
+        obs, start=start, end=end, metric=get_metric("rebuffer"), mode=ComparisonMode.TRAILING_DAYS
+    )
     assert [label.status for label in labels] == [
         BucketStatus.NORMAL,
         BucketStatus.NORMAL,
@@ -85,7 +95,9 @@ def test_label_buckets_marks_a_bucket_with_no_rows_as_unknown_not_normal():
     """A missing actual must never default to 'normal' -- that would make thin
     slices with zero traffic in a bucket silently invisible to the detector."""
     obs, start, end = _series(WINDOW_START, 3, missing={1})
-    labels = label_buckets(obs, start=start, end=end, metric=get_metric("rebuffer"))
+    labels = label_buckets(
+        obs, start=start, end=end, metric=get_metric("rebuffer"), mode=ComparisonMode.TRAILING_DAYS
+    )
     assert labels[0].status is BucketStatus.NORMAL
     assert labels[1].status is BucketStatus.UNKNOWN
     assert labels[1].value is None
@@ -96,7 +108,9 @@ def test_label_buckets_is_insufficient_data_when_trailing_history_is_too_thin():
     """Fewer than min_observations clean comparison days -> UNKNOWN for every bucket,
     regardless of the actual value -- never a confident 'normal'."""
     obs, start, end = _series(WINDOW_START, 4, trailing_days=2, overrides={2: 999.0})
-    labels = label_buckets(obs, start=start, end=end, metric=get_metric("rebuffer"))
+    labels = label_buckets(
+        obs, start=start, end=end, metric=get_metric("rebuffer"), mode=ComparisonMode.TRAILING_DAYS
+    )
     assert all(label.status is BucketStatus.UNKNOWN for label in labels)
 
 
@@ -175,7 +189,13 @@ def test_group_windows_rejects_negative_max_gap():
 def test_detect_from_series_finds_nothing_for_a_single_bucket_blip():
     obs, start, end = _series(WINDOW_START, 6, overrides={2: 20.0})
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="rebuffer", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="rebuffer",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert result.windows == []
     assert result.anomalous_buckets == 1
@@ -185,7 +205,13 @@ def test_detect_from_series_finds_nothing_for_a_single_bucket_blip():
 def test_detect_from_series_reports_one_window_for_a_sustained_incident():
     obs, start, end = _series(WINDOW_START, 6, overrides={2: 20.0, 3: 20.0, 4: 20.0})
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="rebuffer", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="rebuffer",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert len(result.windows) == 1
     window = result.windows[0]
@@ -205,7 +231,13 @@ def test_detect_from_series_keeps_one_window_through_a_single_recovered_bucket()
         WINDOW_START, 7, overrides={1: 20.0, 2: 20.0, 3: 10.0, 4: 20.0, 5: 20.0}
     )
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="rebuffer", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="rebuffer",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert len(result.windows) == 1
     assert result.windows[0].bucket_count == 5
@@ -217,7 +249,13 @@ def test_detect_from_series_is_direction_aware_for_a_bitrate_drop():
         WINDOW_START, 6, baseline_level=5000.0, overrides={2: 2000.0, 3: 2000.0, 4: 2000.0}
     )
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="bitrate", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="bitrate",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert len(result.windows) == 1
     assert result.windows[0].peak_z < -3.0
@@ -232,7 +270,13 @@ def test_detect_from_series_does_not_flag_a_bitrate_rise_as_anomalous():
         WINDOW_START, 6, baseline_level=5000.0, overrides={2: 9000.0, 3: 9000.0, 4: 9000.0}
     )
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="bitrate", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="bitrate",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert result.windows == []
 
@@ -240,7 +284,13 @@ def test_detect_from_series_does_not_flag_a_bitrate_rise_as_anomalous():
 def test_detect_from_series_counts_unknown_buckets_and_never_treats_them_as_windows():
     obs, start, end = _series(WINDOW_START, 5, trailing_days=2)
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="rebuffer", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="rebuffer",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert result.windows == []
     assert result.unknown_buckets == 5
@@ -251,7 +301,13 @@ def test_detect_from_series_counts_unknown_buckets_and_never_treats_them_as_wind
 def test_detection_result_unknown_fraction_reflects_a_mixed_series():
     obs, start, end = _series(WINDOW_START, 4, missing={0, 1})
     result = detect_from_series(
-        obs, slice_=Slice(), metric_name="rebuffer", start=start, end=end, sql="SELECT 1"
+        obs,
+        slice_=Slice(),
+        metric_name="rebuffer",
+        start=start,
+        end=end,
+        sql="SELECT 1",
+        mode=ComparisonMode.TRAILING_DAYS,
     )
     assert result.unknown_buckets == 2
     assert result.total_buckets == 4
@@ -308,3 +364,21 @@ def test_build_series_sql_never_emits_a_bare_count_against_the_rollup():
 def test_fetch_window_start_floors_to_midnight_n_days_before():
     start = fetch_window_start(datetime(2026, 1, 13, 18, 0), trailing_days=7)
     assert start == datetime(2026, 1, 6, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Default comparison mode: week-over-week, not trailing-days.
+# ---------------------------------------------------------------------------
+
+
+def test_default_mode_is_week_over_week():
+    assert DEFAULT_MODE is ComparisonMode.WEEK_OVER_WEEK
+
+
+def test_label_buckets_defaults_to_week_over_week_and_ignores_trailing_day_only_history():
+    """Without an explicit `mode`, label_buckets must use week-over-week -- so a series
+    that only has trailing-day history (no matching weekday 1+ weeks back) produces
+    UNKNOWN, not a baseline built from the wrong days."""
+    obs, start, end = _series(WINDOW_START, 3, overrides={1: 999.0})
+    labels = label_buckets(obs, start=start, end=end, metric=get_metric("rebuffer"))
+    assert all(label.status is BucketStatus.UNKNOWN for label in labels)

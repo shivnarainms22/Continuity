@@ -8,7 +8,7 @@ Ground truth (`data/ground_truth.json`) is the only artifact of this module that
 incident truth, and it never reaches ClickHouse (hard constraint 3): the catalog and
 telemetry tables only ever receive the same columns their DDL defines.
 
-Usage: `uv run python -m continuity.data.load --days 21 [--sessions-per-day N] [--truncate]
+Usage: `uv run python -m continuity.data.load --days 56 [--sessions-per-day N] [--truncate]
 [--seed N]`.
 """
 
@@ -40,7 +40,11 @@ from continuity.data.schema import apply_schema
 # same seed to be byte-identical, and a wall-clock default would break that.
 WINDOW_START = datetime(2026, 1, 1, tzinfo=UTC)
 
-DEFAULT_DAYS = 21
+# 56 days (8 weeks): continuity.analysis.baseline's default week-over-week comparison
+# needs 4 prior weeks of the same weekday for every planted incident (see
+# continuity.data.incidents.build_incidents, which anchors incident placement to the
+# END of the window for exactly this reason). --days remains configurable.
+DEFAULT_DAYS = 56
 DEFAULT_SESSIONS_PER_DAY = 250_000
 DEFAULT_SEED = 20260908
 DEFAULT_BATCH_SIZE = 50_000

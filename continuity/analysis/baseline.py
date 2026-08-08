@@ -5,13 +5,29 @@ Pure maths only -- no SQL, no ClickHouse, no I/O. Operates on plain
 without Docker. Integration with `slices.py` / `metrics.py` happens in a later
 task; this module knows nothing about either.
 
-Baseline for a time-of-day bucket = the MEDIAN of that same bucket over the
-trailing N days (default 7), excluding the day under test. Spread = MAD
-(median absolute deviation), scaled by 1.4826 so it estimates sigma under
-normality. Robust z = (actual - median) / (1.4826 * MAD).
+Two comparison-window strategies select which observations a bucket's actual value is
+measured against:
+
+- `select_week_over_week_window` (the DEFAULT used by `detect.py`): the same (weekday,
+  time-of-day) bucket over the preceding `lookback_weeks` weeks (default 4), excluding
+  the bucket's own day. This removes diurnal AND weekly seasonality by construction.
+- `select_comparison_window`: the same time-of-day bucket over the trailing N days
+  (default 7), excluding the day under test. This removes only diurnal seasonality --
+  correct for metrics with no weekly structure, but on a metric that DOES vary by
+  weekday (bitrate, errors: this dataset averages ~3100 kbps Mon-Thu, ~2900 Fri, ~2525
+  Sat/Sun) a trailing 7-day window contains exactly one instance of the target
+  bucket's own weekday and six of other weekdays. It does not neutralise a weekly
+  pattern, it amplifies it: on a weekend bucket the tight six-day midweek cluster
+  produces a tiny MAD, so the legitimate weekend value reads as a huge |z| -- a false
+  positive every weekend. See
+  `test_trailing_days_mode_false_positives_on_a_legitimate_weekend_value_but_week_over_week_does_not`.
+
+Either way, baseline = the MEDIAN of the selected comparison values. Spread = MAD
+(median absolute deviation), scaled by 1.4826 so it estimates sigma under normality.
+Robust z = (actual - median) / (1.4826 * MAD).
 
 Median and MAD rather than mean and standard deviation, deliberately: a real
-incident sitting in the trailing window inflates a mean/sigma baseline and can
+incident sitting in the comparison window inflates a mean/sigma baseline and can
 mask the next incident. A detector that goes blind after one incident is
 self-defeating. See `test_median_and_mad_barely_move_when_trailing_window_...`
 for the proof.
@@ -31,7 +47,20 @@ import numpy as np
 _MAD_TO_SIGMA = 1.4826
 
 DEFAULT_TRAILING_DAYS = 7
+DEFAULT_LOOKBACK_WEEKS = 4
 DEFAULT_MIN_OBSERVATIONS = 4
+
+
+class ComparisonMode(Enum):
+    """Which comparison-window selection strategy a bucket's baseline is built from.
+
+    WEEK_OVER_WEEK is the default (see module docstring): it removes weekly seasonality
+    as well as diurnal, which TRAILING_DAYS does not. TRAILING_DAYS remains available
+    for metrics with no weekly structure -- it is the original, already-tested strategy.
+    """
+
+    WEEK_OVER_WEEK = "week_over_week"
+    TRAILING_DAYS = "trailing_days"
 
 
 class BaselineStatus(Enum):
@@ -99,6 +128,41 @@ def select_comparison_window(
             continue
         obs_date = ts.date()
         if not (earliest_date <= obs_date < target_date):
+            continue
+        if _is_missing(value):
+            continue
+        selected.append(float(value))
+    return selected
+
+
+def select_week_over_week_window(
+    observations: Sequence[tuple[datetime, float | None]],
+    target: datetime,
+    *,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
+) -> list[float]:
+    """Select values from the same (weekday, time-of-day) bucket over the preceding
+    `lookback_weeks` weeks.
+
+    "Same weekday, same time-of-day" means matching (hour, minute) of `target` on a
+    calendar date exactly `7 * i` days before `target.date()`, for `i` in
+    `1..lookback_weeks` -- i.e. `target`'s own weekday, never any other. Because `i`
+    starts at 1, `target`'s own day is excluded by construction, exactly like
+    `select_comparison_window`'s trailing window. NaN/None values are dropped.
+
+    This is the fix for the flaw `select_comparison_window` has on metrics with weekly
+    structure: it never mixes weekday observations into a weekend baseline (or vice
+    versa), so it cannot manufacture the false positives a trailing-N-days window does.
+    """
+    if lookback_weeks <= 0:
+        raise ValueError(f"lookback_weeks must be > 0, got {lookback_weeks}")
+    target_date = target.date()
+    valid_dates = {target_date - timedelta(weeks=i) for i in range(1, lookback_weeks + 1)}
+    selected: list[float] = []
+    for ts, value in observations:
+        if (ts.hour, ts.minute) != (target.hour, target.minute):
+            continue
+        if ts.date() not in valid_dates:
             continue
         if _is_missing(value):
             continue

@@ -10,6 +10,7 @@ from continuity.analysis.baseline import (
     compute_baseline,
     is_anomalous,
     select_comparison_window,
+    select_week_over_week_window,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,74 @@ def test_select_comparison_window_rejects_non_positive_trailing_days():
     target = datetime(2026, 8, 8, 21, 0)
     with pytest.raises(ValueError, match="trailing_days"):
         select_comparison_window([], target, trailing_days=0)
+
+
+# ---------------------------------------------------------------------------
+# select_week_over_week_window: same weekday, same time-of-day, N weeks back.
+# ---------------------------------------------------------------------------
+
+
+def test_select_week_over_week_window_picks_only_the_same_weekday_same_time_of_day():
+    target = datetime(2026, 8, 8, 21, 0)  # a Saturday
+    same_weekday = _series_at_same_time_of_day([7, 14, 21, 28])  # prior Saturdays
+    other_weekdays = _series_at_same_time_of_day([1, 2, 3, 4, 5, 6])  # every other weekday
+    observations = [*same_weekday, *other_weekdays]
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert sorted(selected) == [17.0, 24.0, 31.0, 38.0]
+
+
+def test_select_week_over_week_window_excludes_the_target_own_day():
+    target = datetime(2026, 8, 8, 21, 0)
+    own_day = (datetime(2026, 8, 8, 21, 0), 999.0)
+    prior_weeks = _series_at_same_time_of_day([7, 14, 21, 28])
+    observations = [own_day, *prior_weeks]
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert 999.0 not in selected
+    assert sorted(selected) == [17.0, 24.0, 31.0, 38.0]
+
+
+def test_select_week_over_week_window_respects_the_lookback_weeks_limit():
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = _series_at_same_time_of_day([7, 14, 21, 28, 35])  # 5 weeks available
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert sorted(selected) == [17.0, 24.0, 31.0, 38.0]  # the 5th week (35 days back) excluded
+
+
+def test_select_week_over_week_window_ignores_different_time_of_day():
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = [
+        (datetime(2026, 8, 1, 21, 0), 100.0),  # 7 days back, matches
+        (datetime(2026, 8, 1, 9, 0), 999.0),  # same day, different hour -- must be excluded
+    ]
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert selected == [100.0]
+
+
+def test_select_week_over_week_window_drops_none_and_nan_values():
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = [
+        (datetime(2026, 8, 1, 21, 0), 10.0),
+        (datetime(2026, 7, 25, 21, 0), None),
+        (datetime(2026, 7, 18, 21, 0), float("nan")),
+    ]
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert selected == [10.0]
+
+
+def test_select_week_over_week_window_returns_fewer_values_when_history_is_short():
+    """Early in the dataset only 2 prior same-weekday weeks exist yet -- the caller
+    (compute_baseline via min_observations) must see exactly 2 values, never a padded
+    or fabricated 4."""
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = _series_at_same_time_of_day([7, 14])
+    selected = select_week_over_week_window(observations, target, lookback_weeks=4)
+    assert sorted(selected) == [17.0, 24.0]
+
+
+def test_select_week_over_week_window_rejects_non_positive_lookback_weeks():
+    target = datetime(2026, 8, 8, 21, 0)
+    with pytest.raises(ValueError, match="lookback_weeks"):
+        select_week_over_week_window([], target, lookback_weeks=0)
 
 
 # ---------------------------------------------------------------------------
@@ -262,3 +331,68 @@ def test_is_anomalous_rejects_negative_threshold():
     result = compute_baseline(10.0, [8.0, 9.0, 10.0, 11.0, 12.0])
     with pytest.raises(ValueError, match="threshold"):
         is_anomalous(result, direction=Direction.HIGHER_IS_WORSE, threshold=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# Regression test for the actual production bug: a trailing-N-days window does not
+# neutralise weekly seasonality, it amplifies it.
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_days_flags_legit_weekend_value_but_week_over_week_does_not():
+    """Measured on the real dataset: bitrate averages ~3100 kbps Mon-Thu, ~2900 Fri,
+    ~2525 Sat/Sun. For a Saturday target, a trailing-7-day window contains exactly ONE
+    prior Saturday and SIX midweek-leaning days, so its median sits near the midweek
+    level (~3100) with a tiny MAD -- a perfectly ordinary weekend value then reads as a
+    huge robust z. Week-over-week (same weekday only) compares the Saturday against
+    prior Saturdays alone, so the same value is unremarkable.
+    """
+    weekday_level = {
+        0: 3100.0,  # Monday
+        1: 3100.0,
+        2: 3100.0,
+        3: 3100.0,  # Thursday
+        4: 2900.0,  # Friday
+        5: 2525.0,  # Saturday
+        6: 2525.0,  # Sunday
+    }
+    jitter_cycle = [-12.0, 8.0, -5.0, 15.0, -8.0, 3.0, -3.0, 10.0]
+
+    target = datetime(2026, 8, 8, 21, 0)  # a Saturday
+    assert target.weekday() == 5
+
+    observations: list[tuple[datetime, float]] = []
+    for day_offset in range(1, 8 * 7 + 1):  # 8 weeks of daily history
+        day = target - timedelta(days=day_offset)
+        level = weekday_level[day.weekday()]
+        jitter = jitter_cycle[day_offset % len(jitter_cycle)]
+        observations.append((day, level + jitter))
+
+    # A legitimate weekend value, consistent with the historical Saturday pattern --
+    # there is no incident here.
+    actual = 2525.0 + jitter_cycle[0]
+
+    trailing_comparison = select_comparison_window(observations, target, trailing_days=7)
+    week_over_week_comparison = select_week_over_week_window(
+        observations, target, lookback_weeks=4
+    )
+
+    trailing_baseline = compute_baseline(actual, trailing_comparison)
+    week_over_week_baseline = compute_baseline(actual, week_over_week_comparison)
+
+    assert trailing_baseline.status is BaselineStatus.OK
+    assert week_over_week_baseline.status is BaselineStatus.OK
+
+    # The bug: trailing-7-day amplifies the weekly pattern into a huge false-positive z.
+    assert trailing_baseline.z == pytest.approx(-16.98, abs=0.1)
+    assert (
+        is_anomalous(trailing_baseline, direction=Direction.LOWER_IS_WORSE, threshold=3.0) is True
+    )
+
+    # The fix: week-over-week never mixes weekday values into a weekend baseline, so
+    # the same legitimate value stays well under threshold.
+    assert week_over_week_baseline.z == pytest.approx(-1.47, abs=0.1)
+    assert (
+        is_anomalous(week_over_week_baseline, direction=Direction.LOWER_IS_WORSE, threshold=3.0)
+        is False
+    )

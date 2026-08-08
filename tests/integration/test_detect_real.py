@@ -1,31 +1,65 @@
-"""Integration tests for continuity/analysis/detect.py against the real 59.8M-event
-dataset (2026-01-01..2026-01-22), read through the MCP gateway.
+"""Integration tests for continuity/analysis/detect.py against the real dataset, read
+through the MCP gateway.
 
 Read-only: no truncation, no writes. Uses the `gateway` fixture from tests/conftest.py,
 which is built from ClickHouseConfig.from_env() -- the DEFAULT database holding the
 full dataset, NOT the `continuity_test` database tests/integration/test_load.py uses.
 
-Ground truth windows (data/ground_truth.json), for reference only -- never read by the
-detector itself:
-  INC-APP-ROKU-820:   device_type=roku AND app_version=8.2.0, rebuffer x4.5,
-                       2026-01-13 18:00 -> 2026-01-14 02:00
-  INC-POP-NW-ATL-2:   cdn=cdn_northwind AND pop=nw-atl-2, startup x3.2,
-                       2026-01-16 02:00 -> 08:00
-  INC-ENCODE-1:       title_id=1, bitrate x0.45, 2026-01-19 09:00 -> 2026-01-20 15:00
-  DECOY-PREMIERE-3:   title_id=3, volume x6, NO QoE effect,
-                       2026-01-21 20:00 -> 2026-01-22 01:00
+Incident windows are DERIVED from data/ground_truth.json rather than hardcoded --
+hardcoded incident dates are what made the week-over-week baseline change (moving
+incident placement to the end of the window, see continuity/data/incidents.py) painful
+to keep in sync. Look up each incident by `kind`, since its `incident_id` embeds a
+dynamically-picked title_id (encode/decoy) that can change between reloads.
+
+REQUIRES A RELOAD before these tests can pass: `detect()` now defaults to
+`ComparisonMode.WEEK_OVER_WEEK`, which needs `DEFAULT_LOOKBACK_WEEKS` (4) weeks of
+prior history for every incident. The dataset currently loaded (and the committed
+data/ground_truth.json) still reflects the old 21-day window with start-relative
+incident offsets, which does not provide that history. Once the 56-day reload (with
+incidents.py's new end-relative placement) runs, this file needs no further changes --
+every window is derived from the regenerated ground truth.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from continuity.analysis.baseline import DEFAULT_LOOKBACK_WEEKS
 from continuity.analysis.detect import detect
 from continuity.analysis.slices import Slice
+from continuity.data.load import WINDOW_START as DATASET_START
 
 pytestmark = pytest.mark.integration
+
+_GROUND_TRUTH_PATH = Path(__file__).resolve().parents[2] / "data" / "ground_truth.json"
+
+
+def _ground_truth_incidents() -> list[dict]:
+    payload = json.loads(_GROUND_TRUTH_PATH.read_text(encoding="utf-8"))
+    return payload["incidents"]
+
+
+def _by_kind(kind: str) -> dict:
+    matches = [inc for inc in _ground_truth_incidents() if inc["kind"] == kind]
+    assert len(matches) == 1, f"expected exactly one {kind!r} incident in ground truth"
+    return matches[0]
+
+
+def _window(incident: dict) -> tuple[datetime, datetime]:
+    start = datetime.fromisoformat(incident["start"]).replace(tzinfo=None)
+    end = datetime.fromisoformat(incident["end"]).replace(tzinfo=None)
+    return start, end
+
+
+def _slice_for(incident: dict) -> Slice:
+    slice_ = Slice()
+    for key, value in incident["predicate"].items():
+        slice_ = slice_.refine(key, value)
+    return slice_
 
 
 def _overlaps(window, true_start: datetime, true_end: datetime) -> bool:
@@ -36,11 +70,16 @@ def _overlaps(window, true_start: datetime, true_end: datetime) -> bool:
 
 
 async def test_detects_roku_820_rebuffer_incident(gateway):
-    true_start, true_end = datetime(2026, 1, 13, 18, 0), datetime(2026, 1, 14, 2, 0)
-    slice_ = Slice().refine("device_type", "roku").refine("app_version", "8.2.0")
+    incident = _by_kind("device_app_fault")
+    true_start, true_end = _window(incident)
+    slice_ = _slice_for(incident)
 
     result = await detect(
-        gateway, slice_, "rebuffer", datetime(2026, 1, 13, 12, 0), datetime(2026, 1, 14, 8, 0)
+        gateway,
+        slice_,
+        "rebuffer",
+        true_start - timedelta(hours=6),
+        true_end + timedelta(hours=6),
     )
 
     assert result.windows, "expected at least one anomaly window for the roku/8.2.0 incident"
@@ -50,21 +89,26 @@ async def test_detects_roku_820_rebuffer_incident(gateway):
     assert all(w.sql == result.sql for w in result.windows)
 
 
-# --- (b) INC-ENCODE-1: direction handling. bitrate is lower-is-worse -------------
+# --- (b) the encode incident: direction handling. bitrate is lower-is-worse -------
 
 
 async def test_detects_encode_incident_on_bitrate_with_correct_direction(gateway):
     """A detector that only looked for increases would miss this incident entirely --
     the encode fault is a bitrate DROP (x0.45), so every reported window must carry a
     negative z, not a positive one."""
-    true_start, true_end = datetime(2026, 1, 19, 9, 0), datetime(2026, 1, 20, 15, 0)
-    slice_ = Slice().refine("title_id", "1")
+    incident = _by_kind("encode_fault")
+    true_start, true_end = _window(incident)
+    slice_ = _slice_for(incident)
 
     result = await detect(
-        gateway, slice_, "bitrate", datetime(2026, 1, 19, 6, 0), datetime(2026, 1, 20, 18, 0)
+        gateway,
+        slice_,
+        "bitrate",
+        true_start - timedelta(hours=3),
+        true_end + timedelta(hours=3),
     )
 
-    assert result.windows, "expected at least one anomaly window for the title_id=1 bitrate crash"
+    assert result.windows, "expected at least one anomaly window for the encode bitrate crash"
     assert any(_overlaps(w, true_start, true_end) for w in result.windows)
     assert all(w.peak_z < 0 for w in result.windows), (
         "bitrate is lower-is-worse; a direction-blind detector would report positive z"
@@ -75,34 +119,51 @@ async def test_detects_encode_incident_on_bitrate_with_correct_direction(gateway
 
 
 async def test_stays_silent_on_the_volume_only_decoy(gateway):
-    """The false-positive test that matters most. DECOY-PREMIERE-3 is a 6x volume
+    """The false-positive test that matters most. The decoy incident is a 6x volume
     spike with effects=[] in ground truth -- rebuffer, the primary QoE health signal,
     must show no anomaly windows across it."""
-    slice_ = Slice().refine("title_id", "3")
+    incident = _by_kind("decoy_premiere")
+    true_start, true_end = _window(incident)
+    slice_ = _slice_for(incident)
 
     result = await detect(
-        gateway, slice_, "rebuffer", datetime(2026, 1, 21, 14, 0), datetime(2026, 1, 22, 6, 0)
+        gateway,
+        slice_,
+        "rebuffer",
+        true_start - timedelta(hours=6),
+        true_end + timedelta(hours=6),
     )
 
     assert result.windows == []
     assert result.total_buckets > 0
 
 
-# --- (d) whole population over a quiet week: replaces the 353 false positives ---
+# --- (d) whole population over a quiet period: replaces the 353 false positives ---
 
 
 async def test_whole_population_quiet_period_produces_zero_anomaly_windows(gateway):
     """Direct replacement for the naive mean+2sigma detector's 353 alerts, all false,
-    all in 18:00-23:00 (see scripts/acceptance_check.py). 2026-01-05..2026-01-10
-    contains five nightly traffic peaks and zero planted incidents.
+    all in 18:00-23:00 (see scripts/acceptance_check.py).
 
-    Individual buckets crossing the robust z threshold are still allowed -- some noise
-    at that level is expected even with a seasonality-aware baseline -- but none of it
-    sustains for min_run_length buckets, so zero WINDOWS are reported. That's the
-    point: run-length + gap-tolerant grouping is what turns per-bucket noise into a
-    silent detector rather than the individual z-score threshold alone.
+    The quiet window is derived, not hardcoded: 3 days of buffer before the earliest
+    planted incident, 5 days long, and asserted to still have `DEFAULT_LOOKBACK_WEEKS`
+    weeks of prior history inside the loaded dataset -- otherwise every bucket would
+    read UNKNOWN rather than genuinely NORMAL, and the `windows == []` assertion below
+    would pass for the wrong reason. `unknown_fraction == 0.0` is the guard against
+    exactly that silent false pass.
     """
-    result = await detect(gateway, Slice(), "rebuffer", datetime(2026, 1, 5), datetime(2026, 1, 10))
+    ground_truth = _ground_truth_incidents()
+    earliest_start = min(_window(inc)[0] for inc in ground_truth)
+    dataset_start = DATASET_START.replace(tzinfo=None)
+
+    end = (earliest_start - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=5)
+    assert start - timedelta(weeks=DEFAULT_LOOKBACK_WEEKS) >= dataset_start, (
+        "derived quiet window does not have enough prior history in the loaded dataset "
+        "for a week-over-week baseline -- check incident placement / --days"
+    )
+
+    result = await detect(gateway, Slice(), "rebuffer", start, end)
 
     assert result.windows == []
     assert result.total_buckets == 1440  # 5 days * 288 five-minute buckets/day

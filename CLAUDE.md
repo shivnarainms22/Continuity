@@ -82,7 +82,7 @@ uv run ruff check .
 uv run ruff format .
 
 # Data
-uv run python -m continuity.data.load --days 21
+uv run python -m continuity.data.load --days 56
 ```
 
 `gcloud` is installed at user scope. If it is not on PATH, use:

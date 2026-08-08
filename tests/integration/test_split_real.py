@@ -9,11 +9,18 @@ neither dimension alone identifies the fault; only the two-step composition does
 Read only. Uses the DEFAULT database from ClickHouseConfig.from_env() via the `gateway`
 fixture in tests/conftest.py -- NOT the separate continuity_test database used by
 test_load.py.
+
+split.py's own baseline (window - 7 days) only needs 7 days of prior history, so this
+file's windows -- derived from data/ground_truth.json -- work against either the
+currently-loaded 21-day dataset or a reloaded 56-day one. No reload is required for
+this file specifically, unlike tests/integration/test_detect_real.py.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -23,11 +30,25 @@ from continuity.analysis.split import split_dimension
 
 pytestmark = pytest.mark.integration
 
-# The INC-APP-ROKU-820 window, from data/ground_truth.json.
-_WINDOW_START = datetime(2026, 1, 13, 18, 0, 0)
-_WINDOW_END = datetime(2026, 1, 14, 2, 0, 0)
+_GROUND_TRUTH_PATH = Path(__file__).resolve().parents[2] / "data" / "ground_truth.json"
+
+
+def _roku_820_window() -> tuple[datetime, datetime]:
+    """The INC-APP-ROKU-820 window, derived from data/ground_truth.json rather than
+    hardcoded -- incident placement moved to be relative to the end of the window (see
+    continuity/data/incidents.py), so a hardcoded date here would drift out of sync."""
+    payload = json.loads(_GROUND_TRUTH_PATH.read_text(encoding="utf-8"))
+    incident = next(inc for inc in payload["incidents"] if inc["kind"] == "device_app_fault")
+    start = datetime.fromisoformat(incident["start"]).replace(tzinfo=None)
+    end = datetime.fromisoformat(incident["end"]).replace(tzinfo=None)
+    return start, end
+
+
+_WINDOW_START, _WINDOW_END = _roku_820_window()
 _WINDOW = (_WINDOW_START, _WINDOW_END)
-# Same time-of-day, 7 days earlier: a normal period unaffected by the incident.
+# Same time-of-day, 7 days earlier: a normal period unaffected by the incident. This is
+# split.py's own baseline convention, unrelated to continuity/analysis/baseline.py's
+# week-over-week fix -- split.py is out of scope for that change.
 _BASELINE_WINDOW = (_WINDOW_START - timedelta(days=7), _WINDOW_END - timedelta(days=7))
 
 

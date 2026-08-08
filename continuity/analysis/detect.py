@@ -6,10 +6,17 @@ buckets into contiguous ANOMALY WINDOWS. A lone 5-minute blip is noise; a sustai
 is an incident -- see `group_windows` for the run-length + gap-tolerance logic that
 makes that distinction.
 
+The DEFAULT comparison strategy is `ComparisonMode.WEEK_OVER_WEEK` (baseline.py): every
+bucket is measured against the same weekday's same time-of-day bucket over the
+preceding `lookback_weeks` weeks, which removes weekly seasonality as well as diurnal.
+`ComparisonMode.TRAILING_DAYS` (the original strategy) remains available for metrics
+with no weekly structure -- see baseline.py's module docstring for why trailing-N-days
+alone produces false positives on metrics that do vary by weekday.
+
 The maths (`label_buckets`, `group_windows`, `detect_from_series`) is pure and testable
 without Docker. Only `detect()` touches the gateway, and it does so with exactly one
-query: the trailing baseline window and the test window are pulled together, per Task 1's
-benchmark (a 7-day 5-minute series costs ~41ms).
+query: the whole comparison history and the test window are pulled together, per Task
+1's benchmark (a 7-day 5-minute series costs ~41ms).
 
 Buckets whose baseline could not be computed (`BaselineStatus.INSUFFICIENT_DATA`) are
 UNKNOWN, never silently folded into "normal" -- `DetectionResult.unknown_fraction` lets a
@@ -24,14 +31,17 @@ from datetime import datetime, timedelta
 from enum import Enum
 
 from continuity.analysis.baseline import (
+    DEFAULT_LOOKBACK_WEEKS,
     DEFAULT_MIN_OBSERVATIONS,
     DEFAULT_TRAILING_DAYS,
     Baseline,
     BaselineStatus,
+    ComparisonMode,
     Direction,
     compute_baseline,
     is_anomalous,
     select_comparison_window,
+    select_week_over_week_window,
 )
 from continuity.analysis.metrics import Metric, get_metric
 from continuity.analysis.slices import Slice
@@ -45,6 +55,10 @@ BUCKET_WIDTH = timedelta(minutes=5)
 # (see tests/integration/test_detect_real.py) -- a naive mean+2sigma detector with no
 # run-length requirement produced 353 false alerts, all in 18:00-23:00.
 DEFAULT_THRESHOLD = 3.0
+
+# Week-over-week is the default comparison strategy -- see the module docstring for why
+# trailing-days alone is wrong for metrics with weekly structure (bitrate, errors).
+DEFAULT_MODE = ComparisonMode.WEEK_OVER_WEEK
 
 # A single 5-minute blip is noise. Three consecutive anomalous buckets (15 minutes) is
 # the shortest run that separated the planted incidents from noise on this dataset.
@@ -139,9 +153,15 @@ def fetch_window_start(start: datetime, trailing_days: int = DEFAULT_TRAILING_DA
     """Start of the range to fetch: midnight `trailing_days` days before `start`'s date.
 
     Flooring to midnight (rather than subtracting `trailing_days` from `start` directly)
-    guarantees every trailing day is fetched in full, regardless of what time of day
+    guarantees every comparison day is fetched in full, regardless of what time of day
     `start` itself falls on -- otherwise the first fetched day would be missing its
     early hours and every early-morning target bucket would lose one comparison day.
+
+    Despite the name, `trailing_days` here just means "how many calendar days of
+    history to fetch" -- `detect()` passes `trailing_days` itself under
+    `ComparisonMode.TRAILING_DAYS`, or `lookback_weeks * 7` under
+    `ComparisonMode.WEEK_OVER_WEEK`, so the fetched range covers whichever comparison
+    window `mode` needs.
     """
     return datetime.combine(start.date() - timedelta(days=trailing_days), datetime.min.time())
 
@@ -174,13 +194,28 @@ def build_series_sql(
     )
 
 
+def _select_comparison(
+    observations: Sequence[tuple[datetime, float | None]],
+    bucket: datetime,
+    *,
+    mode: ComparisonMode,
+    trailing_days: int,
+    lookback_weeks: int,
+) -> list[float]:
+    if mode is ComparisonMode.WEEK_OVER_WEEK:
+        return select_week_over_week_window(observations, bucket, lookback_weeks=lookback_weeks)
+    return select_comparison_window(observations, bucket, trailing_days=trailing_days)
+
+
 def label_buckets(
     observations: Sequence[tuple[datetime, float | None]],
     *,
     start: datetime,
     end: datetime,
     metric: Metric,
+    mode: ComparisonMode = DEFAULT_MODE,
     trailing_days: int = DEFAULT_TRAILING_DAYS,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
     threshold: float = DEFAULT_THRESHOLD,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
 ) -> list[BucketLabel]:
@@ -195,7 +230,13 @@ def label_buckets(
     labels: list[BucketLabel] = []
     for bucket in _bucket_range(start, end):
         actual = by_bucket.get(bucket)
-        comparison = select_comparison_window(observations, bucket, trailing_days=trailing_days)
+        comparison = _select_comparison(
+            observations,
+            bucket,
+            mode=mode,
+            trailing_days=trailing_days,
+            lookback_weeks=lookback_weeks,
+        )
         result = compute_baseline(actual, comparison, min_observations=min_observations)
         if result.status is BaselineStatus.INSUFFICIENT_DATA:
             status = BucketStatus.UNKNOWN
@@ -303,7 +344,9 @@ def detect_from_series(
     start: datetime,
     end: datetime,
     sql: str,
+    mode: ComparisonMode = DEFAULT_MODE,
     trailing_days: int = DEFAULT_TRAILING_DAYS,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
     threshold: float = DEFAULT_THRESHOLD,
     min_run_length: int = DEFAULT_MIN_RUN_LENGTH,
     max_gap: int = DEFAULT_MAX_GAP,
@@ -318,7 +361,9 @@ def detect_from_series(
         start=start,
         end=end,
         metric=metric,
+        mode=mode,
         trailing_days=trailing_days,
+        lookback_weeks=lookback_weeks,
         threshold=threshold,
         min_observations=min_observations,
     )
@@ -354,7 +399,9 @@ async def detect(
     start: datetime,
     end: datetime,
     *,
+    mode: ComparisonMode = DEFAULT_MODE,
     trailing_days: int = DEFAULT_TRAILING_DAYS,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
     threshold: float = DEFAULT_THRESHOLD,
     min_run_length: int = DEFAULT_MIN_RUN_LENGTH,
     max_gap: int = DEFAULT_MAX_GAP,
@@ -363,7 +410,8 @@ async def detect(
     """Fetch the series through the MCP gateway (one query) and detect anomaly windows
     over [start, end). This is the only function in this module that performs I/O."""
     metric = get_metric(metric_name)
-    fetch_start = fetch_window_start(start, trailing_days)
+    days_of_history = trailing_days if mode is ComparisonMode.TRAILING_DAYS else lookback_weeks * 7
+    fetch_start = fetch_window_start(start, days_of_history)
     sql = build_series_sql(slice_, metric, fetch_start, end)
     result = await gateway.query(sql)
     observations = [(_parse_bucket(row["bucket"]), row["value"]) for row in result.rows]
@@ -374,7 +422,9 @@ async def detect(
         start=start,
         end=end,
         sql=sql,
+        mode=mode,
         trailing_days=trailing_days,
+        lookback_weeks=lookback_weeks,
         threshold=threshold,
         min_run_length=min_run_length,
         max_gap=max_gap,
