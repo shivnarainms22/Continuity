@@ -1,0 +1,7 @@
+# Normalise line endings. Judges will clone this on Linux.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.parquet binary
+LICENSE text eol=lf
