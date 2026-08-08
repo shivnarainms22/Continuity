@@ -15,6 +15,17 @@ shape and deliberately omits the weekday term (see its docstring). This module s
 the missing `weekday_factor(bucket.weekday())` multiplier, because `load_factor` already
 includes the weekday term -- omitting it here would make a Saturday show higher load and
 worse QoE than a Tuesday on identical session volume.
+
+SESSION LENGTH: heartbeat count per session is drawn from a right-skewed lognormal
+(most sessions short, a long tail of near-full-length viewing), not a fixed constant.
+A fixed count would give every session identical `watched_ms`, which is both a visible
+synthetic-data tell (`GROUP BY session_id` always returns the same count) and would make
+downstream "watch-time lost" impact figures a trivial constant multiple of session count.
+The median scales with the sampled title's `content_type` (movies run longer than series
+episodes) using each session's own randomly-drawn title -- this needs no extra Python loop
+since it is a single array index (`content_type_median[title_idx]`) alongside the existing
+vectorised title draw. Expansion into per-heartbeat rows uses the standard ragged-array
+`np.repeat`/`cumsum` trick, so variable-length sessions stay fully vectorised.
 """
 
 from __future__ import annotations
@@ -66,8 +77,19 @@ BUCKETS_PER_DAY = 288
 BUCKET_MINUTES = 5
 BUCKET_MS = BUCKET_MINUTES * 60 * 1000
 HEARTBEAT_INTERVAL_MS = 30_000
-HEARTBEATS_PER_SESSION = 6
-SESSION_DURATION_MS = (HEARTBEATS_PER_SESSION + 1) * HEARTBEAT_INTERVAL_MS
+
+# Session length distribution: lognormal, so most sessions are short and a long tail
+# runs near MAX_HEARTBEATS_PER_SESSION. `median` is the distribution's median heartbeat
+# count (movies get a higher median than series episodes); sigma controls the skew.
+MIN_HEARTBEATS_PER_SESSION = 1
+MAX_HEARTBEATS_PER_SESSION = 60
+HEARTBEAT_LOGNORMAL_SIGMA = 0.8
+DEFAULT_MEDIAN_HEARTBEATS = 5.0
+CONTENT_TYPE_MEDIAN_HEARTBEATS: dict[str, float] = {
+    "movie": 9.0,
+    "series": 5.0,
+    "special": 5.0,
+}
 
 # Baseline QoE, before the load coupling and any incident effect are applied.
 BASE_REBUFFER_PROB = 0.12
@@ -140,6 +162,15 @@ def generate(
 
     rng = np.random.default_rng(seed)
     title_ids = np.array([t.title_id for t in titles], dtype=np.uint32)
+    # Per-title median heartbeat count, indexed in parallel with `title_ids` so a
+    # session's content-type-aware length is a single array lookup, not a per-row loop.
+    content_type_median = np.array(
+        [
+            CONTENT_TYPE_MEDIAN_HEARTBEATS.get(t.content_type, DEFAULT_MEDIAN_HEARTBEATS)
+            for t in titles
+        ],
+        dtype=float,
+    )
     subscriber_ids = np.array([s.subscriber_id for s in subscribers], dtype=np.uint32)
     incidents = tuple(incidents)
 
@@ -148,7 +179,9 @@ def generate(
 
     for i in range(days * BUCKETS_PER_DAY):
         bucket = window_start + timedelta(minutes=BUCKET_MINUTES * i)
-        rows = _generate_bucket(rng, bucket, sessions_per_day, title_ids, subscriber_ids, incidents)
+        rows = _generate_bucket(
+            rng, bucket, sessions_per_day, title_ids, content_type_median, subscriber_ids, incidents
+        )
         if rows is None:
             continue
         for c in PLAYBACK_EVENTS_COLUMNS:
@@ -181,6 +214,7 @@ def _generate_bucket(
     bucket: datetime,
     sessions_per_day: int,
     title_ids: np.ndarray,
+    content_type_median: np.ndarray,
     subscriber_ids: np.ndarray,
     incidents: tuple[PlantedIncident, ...],
 ) -> dict[str, np.ndarray] | None:
@@ -236,6 +270,20 @@ def _generate_bucket(
     for extra_n, forced_title in extra_slices:
         title_id[offset : offset + extra_n] = forced_title
         offset += extra_n
+
+    # Session length: right-skewed lognormal median-per-title (volume-boosted "extra"
+    # sessions get the catalog-wide default median rather than a per-title lookup --
+    # their forced title need not even be present in this dataset's title catalog).
+    median_heartbeats = np.full(total_n, DEFAULT_MEDIAN_HEARTBEATS)
+    if base_n > 0 and len(content_type_median) > 0:
+        median_heartbeats[:base_n] = content_type_median[title_idx[:base_n]]
+    raw_heartbeats = rng.lognormal(
+        mean=np.log(median_heartbeats), sigma=HEARTBEAT_LOGNORMAL_SIGMA, size=total_n
+    )
+    heartbeat_counts = np.clip(
+        np.round(raw_heartbeats), MIN_HEARTBEATS_PER_SESSION, MAX_HEARTBEATS_PER_SESSION
+    ).astype(np.int64)
+    session_duration_ms = (heartbeat_counts + 1) * HEARTBEAT_INTERVAL_MS
 
     subscriber_idx = rng.integers(0, len(subscriber_ids), size=total_n)
     subscriber_id = subscriber_ids[subscriber_idx]
@@ -299,7 +347,7 @@ def _generate_bucket(
     bucket_np = np.datetime64(bucket.replace(tzinfo=None), "ms")
     start_offset = rng.integers(0, BUCKET_MS, size=total_n).astype("timedelta64[ms]")
     start_time = bucket_np + start_offset
-    end_time = start_time + np.timedelta64(SESSION_DURATION_MS, "ms")
+    end_time = start_time + session_duration_ms.astype("timedelta64[ms]")
 
     session_id = _make_session_ids(rng, total_n)
 
@@ -331,32 +379,33 @@ def _generate_bucket(
         )
     )
 
-    hb_n = total_n * HEARTBEATS_PER_SESSION
-    hb_offsets = np.tile(
-        (np.arange(1, HEARTBEATS_PER_SESSION + 1) * HEARTBEAT_INTERVAL_MS).astype(
-            "timedelta64[ms]"
-        ),
-        total_n,
-    )
+    # Ragged-to-flat expansion: each session contributes `heartbeat_counts[i]` rows.
+    # np.repeat handles the variable-length broadcast without any per-session Python
+    # loop; `hb_seq` (0-based position within its own session) comes from the standard
+    # cumsum trick, also fully vectorised.
+    hb_n = int(heartbeat_counts.sum())
+    hb_session_start = np.cumsum(heartbeat_counts) - heartbeat_counts
+    hb_seq = np.arange(hb_n) - np.repeat(hb_session_start, heartbeat_counts)
+    hb_offsets = ((hb_seq + 1) * HEARTBEAT_INTERVAL_MS).astype("timedelta64[ms]")
     groups.append(
         _row_group(
-            event_time=np.repeat(start_time, HEARTBEATS_PER_SESSION) + hb_offsets,
-            session_id=np.repeat(session_id, HEARTBEATS_PER_SESSION),
-            subscriber_id=np.repeat(subscriber_id, HEARTBEATS_PER_SESSION),
-            title_id=np.repeat(title_id, HEARTBEATS_PER_SESSION),
-            device_type=np.repeat(device_type, HEARTBEATS_PER_SESSION),
-            os_version=np.repeat(os_version, HEARTBEATS_PER_SESSION),
-            app_version=np.repeat(app_version, HEARTBEATS_PER_SESSION),
-            cdn=np.repeat(cdn, HEARTBEATS_PER_SESSION),
-            pop=np.repeat(pop, HEARTBEATS_PER_SESSION),
-            isp=np.repeat(isp, HEARTBEATS_PER_SESSION),
-            country=np.repeat(country, HEARTBEATS_PER_SESSION),
-            region=np.repeat(region, HEARTBEATS_PER_SESSION),
+            event_time=np.repeat(start_time, heartbeat_counts) + hb_offsets,
+            session_id=np.repeat(session_id, heartbeat_counts),
+            subscriber_id=np.repeat(subscriber_id, heartbeat_counts),
+            title_id=np.repeat(title_id, heartbeat_counts),
+            device_type=np.repeat(device_type, heartbeat_counts),
+            os_version=np.repeat(os_version, heartbeat_counts),
+            app_version=np.repeat(app_version, heartbeat_counts),
+            cdn=np.repeat(cdn, heartbeat_counts),
+            pop=np.repeat(pop, heartbeat_counts),
+            isp=np.repeat(isp, heartbeat_counts),
+            country=np.repeat(country, heartbeat_counts),
+            region=np.repeat(region, heartbeat_counts),
             event_type=np.full(hb_n, "heartbeat", dtype=object),
             watched_ms=np.full(hb_n, HEARTBEAT_INTERVAL_MS, dtype=np.uint32),
             rebuffer_ms=np.zeros(hb_n, dtype=np.uint32),
             startup_ms=np.zeros(hb_n, dtype=np.uint32),
-            bitrate_kbps=np.repeat(bitrate_amount, HEARTBEATS_PER_SESSION),
+            bitrate_kbps=np.repeat(bitrate_amount, heartbeat_counts),
             error_code=np.full(hb_n, "", dtype=object),
         )
     )
@@ -386,7 +435,7 @@ def _generate_bucket(
 
     if stall.any():
         n_stall = int(stall.sum())
-        rebuffer_offset = rng.integers(0, SESSION_DURATION_MS, size=n_stall).astype(
+        rebuffer_offset = rng.integers(0, session_duration_ms[stall], size=n_stall).astype(
             "timedelta64[ms]"
         )
         groups.append(
@@ -414,7 +463,9 @@ def _generate_bucket(
 
     if error_flag.any():
         n_error = int(error_flag.sum())
-        error_offset = rng.integers(0, SESSION_DURATION_MS, size=n_error).astype("timedelta64[ms]")
+        error_offset = rng.integers(0, session_duration_ms[error_flag], size=n_error).astype(
+            "timedelta64[ms]"
+        )
         groups.append(
             _row_group(
                 event_time=start_time[error_flag] + error_offset,

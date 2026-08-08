@@ -475,6 +475,78 @@ def test_large_request_yields_more_than_one_batch():
         assert len(batch["event_time"]) == 5_000
 
 
+# --- Session length: variable, right-skewed heartbeat counts ---------------------
+
+
+def _session_event_counts(
+    session_id: np.ndarray, event_type: np.ndarray
+) -> tuple[dict, dict, dict]:
+    """Single O(n) hash-based pass -- see the np.isin warning on
+    `_rebuffer_totals_by_session_group`."""
+    heartbeat_counts: dict = {}
+    start_counts: dict = {}
+    end_counts: dict = {}
+    for sid, et in zip(session_id, event_type, strict=True):
+        if et == "heartbeat":
+            heartbeat_counts[sid] = heartbeat_counts.get(sid, 0) + 1
+        elif et == "start":
+            start_counts[sid] = start_counts.get(sid, 0) + 1
+        elif et == "end":
+            end_counts[sid] = end_counts.get(sid, 0) + 1
+    return heartbeat_counts, start_counts, end_counts
+
+
+def test_session_heartbeat_counts_genuinely_vary_and_are_right_skewed():
+    """A fixed heartbeat count would give every session identical watched_ms, which is
+    both a visible synthetic-data tell and makes 'watch-time lost' a trivial constant
+    multiple of session count. The distribution must have real spread and skew right
+    (median below mean), not just take more than one distinct value by accident."""
+    data = _collect(seed=31, window_start=WINDOW_START, days=1, sessions_per_day=4000)
+    heartbeat_counts, _, _ = _session_event_counts(data["session_id"], data["event_type"])
+    counts = np.array(list(heartbeat_counts.values()))
+
+    assert len(set(counts.tolist())) >= 5, "heartbeat counts barely vary across sessions"
+    assert counts.min() >= 1, "minimum of 1 heartbeat must be respected"
+    assert np.median(counts) < np.mean(counts), "distribution should be right-skewed"
+
+
+def test_movie_sessions_run_longer_than_series_sessions_on_average():
+    """Content type should influence session length where it is cheap to do so."""
+    rng = np.random.default_rng(99)
+    titles = generate_titles(rng, 200, as_of=WINDOW_START.date())
+    movie_ids = {t.title_id for t in titles if t.content_type == "movie"}
+    series_ids = {t.title_id for t in titles if t.content_type == "series"}
+    assert movie_ids and series_ids, "test fixture needs both content types present"
+
+    data = _collect(
+        seed=32, window_start=WINDOW_START, days=1, sessions_per_day=6000, titles=titles
+    )
+    heartbeat_counts, _, _ = _session_event_counts(data["session_id"], data["event_type"])
+    title_by_session: dict = {}
+    for sid, title in zip(data["session_id"], data["title_id"].astype(np.int64), strict=True):
+        title_by_session.setdefault(sid, title)
+
+    movie_lengths = [
+        count for sid, count in heartbeat_counts.items() if title_by_session[sid] in movie_ids
+    ]
+    series_lengths = [
+        count for sid, count in heartbeat_counts.items() if title_by_session[sid] in series_ids
+    ]
+    assert movie_lengths and series_lengths
+    assert np.mean(movie_lengths) > np.mean(series_lengths)
+
+
+def test_every_session_still_has_exactly_one_start_and_one_end():
+    data = _collect(seed=33, window_start=WINDOW_START, days=1, sessions_per_day=3000)
+    _, start_counts, end_counts = _session_event_counts(data["session_id"], data["event_type"])
+
+    all_sessions = set(data["session_id"].tolist())
+    assert set(start_counts) == all_sessions
+    assert set(end_counts) == all_sessions
+    assert all(count == 1 for count in start_counts.values())
+    assert all(count == 1 for count in end_counts.values())
+
+
 # --- change_log_rows ---------------------------------------------------------------
 
 
