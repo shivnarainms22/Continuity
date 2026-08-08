@@ -81,6 +81,33 @@ That makes the system measurable rather than merely demonstrable:
 | Attribution top-1 | ranked the true cause first |
 | Impact error | ARR-at-risk estimate vs. ground truth |
 
+### Dataset acceptance, verified on 59.8M events
+
+Before any agent work began, the dataset itself had to prove it can support the product.
+`scripts/acceptance_check.py` reads it the way an analyst would — through the MCP gateway,
+so it also exercises the runtime path at full scale:
+
+```
+Dataset: 59,802,205 events, 5,501,034 sessions, 3 change-log entries
+
+  [+] INC-APP-ROKU-820   rebuffer 0.003748 inside vs 0.001171 control  (3.20x, planted 4.5x)
+  [+] INC-POP-NW-ATL-2   p95 startup 10,190ms vs 3,368ms control       (3.03x, planted 3.2x)
+  [+] INC-ENCODE-1       bitrate 1,127kbps vs 2,322kbps control        (0.49x, planted 0.45x)
+  [+] DECOY-PREMIERE-3   volume 3.6x, rebuffer 0.87x  -- a spike, not a fault
+  [+] naive threshold detector: 100% of alerts fall in 18:00-23:00
+  [+] no ClickHouse table contains incident ground truth
+6/6 checks passed
+```
+
+Each incident is compared against **the same dimension slice at the same hours on other
+days**, holding both the audience segment and the time of day fixed — so a deviation
+cannot be explained by "Roku users rebuffer more" or "everything is worse at 9pm".
+
+The fifth line is the one that justifies the architecture. Because the generator couples
+QoE to concurrency, a fixed-threshold detector fires *every night at peak*. That is the
+false-positive problem real ops teams have, and it is why the Detect stage needs a
+seasonality-aware baseline rather than a threshold.
+
 ---
 
 ## Running it
