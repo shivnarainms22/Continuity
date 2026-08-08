@@ -1,0 +1,95 @@
+# Continuity — Project Instructions
+
+Agentic incident investigation for streaming video quality of experience.
+Built for the Agentic Cinema hackathon, **ClickHouse track**. Deadline **2026-09-07, 2:00pm PDT**.
+
+- Design spec: `docs/superpowers/specs/2026-08-08-continuity-design.md`
+- Master plan: `docs/superpowers/plans/2026-08-08-continuity-master.md`
+- Setup checklist: `docs/SETUP.md`
+
+---
+
+## Hard constraints — violating any of these disqualifies the submission
+
+1. **Only Google AI packages may be used at runtime.** Permitted: `google-adk`, `google-genai`,
+   `google-generativeai`, `google-cloud-aiplatform`. AI models, agent frameworks and AI APIs from
+   every other vendor (OpenAI, Anthropic, AWS, Microsoft, …) are prohibited. Non-AI third-party
+   libraries are fine. Check `pyproject.toml` before adding any dependency.
+2. **ClickHouse must be accessed at runtime through the official `mcp-clickhouse` server.**
+   Agent-runtime reads go through `continuity/gateway/mcp_gateway.py` and nothing else.
+   Bulk loading (`continuity/data/load.py`) uses `clickhouse-connect` directly — that is build-time
+   ops, not agent runtime, and the distinction is stated explicitly in the README.
+3. **Ground truth never enters ClickHouse.** Planted-incident truth lives in `data/ground_truth.json`
+   and is read only by the eval harness. The agent must not be able to discover the answers.
+4. **The deterministic analysis engine contains no LLM calls.** Detection, drill-down, correlation
+   and impact are statistics. Gemini decides what to investigate and writes prose; it never
+   sources a number.
+
+---
+
+## Tech stack
+
+| Layer | Choice |
+|---|---|
+| Language | Python 3.13.1 |
+| Package manager | uv 0.10.2 |
+| Database | ClickHouse 25.8 (Docker locally; Cloud or self-hosted GCE for the demo) |
+| Runtime DB access | `mcp-clickhouse` via `mcp` client |
+| Bulk load | `clickhouse-connect` |
+| Agent framework | `google-adk` (added in sub-project 3) |
+| Model | Gemini via Vertex AI — **pin the exact model ID by listing from the live API, never from docs** |
+| API | FastAPI + SSE (sub-project 4) |
+| Frontend | React + Vite + Tailwind (sub-project 4) |
+| Deploy | Cloud Run, project `agentic-hackathon-504919`, region `us-central1` |
+
+---
+
+## Commands
+
+```bash
+# Environment
+uv sync                                    # install deps
+docker compose up -d                       # start local ClickHouse
+docker compose ps                          # expect status "healthy"
+
+# Test
+uv run pytest -m "not integration"         # fast, no Docker needed
+uv run pytest -m integration               # needs ClickHouse running
+uv run pytest                              # everything
+
+# Lint / format
+uv run ruff check .
+uv run ruff format .
+
+# Data
+uv run python -m continuity.data.load --days 21
+```
+
+`gcloud` is installed at user scope. If it is not on PATH, use:
+`"$LOCALAPPDATA/Google/Cloud SDK/google-cloud-sdk/bin/gcloud"`
+
+---
+
+## Conventions
+
+- **TDD.** Failing test first, then minimal implementation. Tests are named for behaviour, not
+  implementation.
+- **Never work on `main`.** Branch per sub-project: `feat/data-foundation`, `feat/analysis-core`, …
+- **Pure logic stays pure.** `seasonality.py`, `topology.py`, `incidents.py` have no I/O so the
+  subtle logic is testable without Docker. Keep it that way.
+- **Errors are never swallowed.** A failed query must raise, never degrade into an empty result.
+  A silent partial failure is invisible by construction and will make every downstream stage
+  confidently wrong.
+- **Every query is recorded.** The gateway logs SQL and duration so each claim in a generated brief
+  can link back to the query that produced it. This is a product feature, not debug logging.
+- **No secrets in code or logs.** `ClickHouseConfig.__repr__` redacts the password; keep it that way.
+- Line length 100. `ruff` governs style — do not hand-format around it.
+
+---
+
+## Environment notes
+
+- Platform is Windows 11; the shell is PowerShell, with Git Bash also available.
+- Docker Desktop must be running before any integration test.
+- Fixed generation seed (`CONTINUITY_SEED`) keeps datasets reproducible. The eval harness depends
+  on regeneration being byte-identical — do not introduce unseeded randomness.

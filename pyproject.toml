@@ -1,0 +1,50 @@
+[project]
+name = "continuity"
+version = "0.1.0"
+description = "Agentic incident investigation for streaming video quality of experience"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "clickhouse-connect>=0.8",
+    "mcp-clickhouse>=0.1.10",
+    "mcp>=1.9",
+    "numpy>=2.1",
+    "pydantic>=2.9",
+    "python-dotenv>=1.0",
+    "typer>=0.15",
+]
+
+# NOTE ON AI DEPENDENCIES
+# The Agentic Cinema hackathon rules permit exactly these AI packages:
+#   google-adk, google-genai, google-generativeai, google-cloud-aiplatform
+# and prohibit AI models, agent frameworks and AI APIs from every other vendor.
+# Google packages are added in sub-project 3. No other vendor's AI SDK may ever
+# appear in this file.
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a running ClickHouse (deselect with '-m \"not integration\"')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["continuity"]

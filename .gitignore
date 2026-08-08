@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+*.egg-info/
+
+# Generated data. ground_truth.json is regenerated deterministically from a seed and
+# is deliberately kept out of the repo: the agent must never be able to read it.
+data/*.json
+data/*.parquet
+data/*.csv

@@ -1,0 +1,28 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    container_name: continuity-ch
+    ports:
+      # 8123 is the HTTP interface. mcp-clickhouse connects over HTTP (8123/8443),
+      # not the native TCP protocol, so this port is the one that matters.
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: continuity
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: continuity_dev
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ch_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  ch_data:
