@@ -178,6 +178,35 @@ def _column_values(batch: dict, column: str) -> list:
     return values.tolist()
 
 
+# Settings applied to bulk inserts only, never to analytical queries.
+#
+# Every insert into playback_events triggers the qoe_rollup_5m materialized view, which
+# runs a nine-dimension GROUP BY whose groups each hold a uniq sketch and a
+# quantilesTDigest sketch. ClickHouse builds one hash table PER AGGREGATION THREAD, so on a
+# many-core machine the view's memory is multiplied by the thread count: loading died with
+# "(total) memory limit exceeded ... would use 5.97 GiB" while resident memory sat under
+# 800 MiB. Capping insert-path threads fixed it.
+#
+# The block-size settings matter for a non-obvious reason: shrinking the client's batch
+# size alone does nothing, because ClickHouse squashes incoming inserts up to
+# min_insert_block_size_rows (default 1,048,576) BEFORE pushing to the view. Capping the
+# squash is what actually bounds the aggregation.
+#
+# These live here rather than in a mounted server config so they travel to ClickHouse Cloud
+# and so they never throttle the drill-down queries, whose latency depends on parallelism.
+#
+# Do NOT add max_bytes_before_external_group_by: enabling the spill made this dramatically
+# worse (failing at 325k rows rather than 65M) because AggregatingTransform reserves
+# against the server total.
+_INSERT_SETTINGS = {
+    "max_threads": 4,
+    "max_insert_threads": 2,
+    "max_insert_block_size": 131072,
+    "min_insert_block_size_rows": 131072,
+    "min_insert_block_size_bytes": 0,
+}
+
+
 def _insert(client, table: str, data: list[tuple], column_names: Sequence[str]) -> int:
     try:
         client.insert(table, data, column_names=list(column_names))
@@ -204,6 +233,7 @@ def _load_playback_events(
             client.insert(
                 "playback_events",
                 columns,
+                settings=_INSERT_SETTINGS,
                 column_names=list(PLAYBACK_EVENTS_COLUMNS),
                 column_oriented=True,
             )
