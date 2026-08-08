@@ -6,10 +6,18 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "clickhouse-connect>=0.8",
-    "mcp-clickhouse>=0.1.10",
-    "mcp>=1.9",
+    "mcp-clickhouse>=0.4.1",
+    # mcp MUST stay below 2.0. fastmcp 2.14 (a mcp-clickhouse dependency) declares
+    # "mcp>=1.24.0" with no upper bound, but mcp 2.0.0 renamed McpError -> MCPError,
+    # so fastmcp fails at import. The client-side API we use (ClientSession,
+    # StdioServerParameters, stdio_client) is identical across 1.x.
+    "mcp>=1.24,<2.0",
     "numpy>=2.1",
     "pydantic>=2.9",
+    # fastmcp (a mcp-clickhouse dependency) imports pydantic_settings but does not
+    # declare it, so the MCP server crashes on startup without this. The failure is
+    # opaque from the client side -- it surfaces only as "Connection closed".
+    "pydantic-settings>=2.6",
     "python-dotenv>=1.0",
     "typer>=0.15",
 ]
@@ -30,6 +38,10 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# One event loop for the whole run so the module-scoped mcp-clickhouse session can be
+# shared. Spawning a server per test costs ~20s each in first-connection setup.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 markers = [
     "integration: requires a running ClickHouse (deselect with '-m \"not integration\"')",

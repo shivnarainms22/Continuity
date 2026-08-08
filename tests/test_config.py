@@ -69,10 +69,17 @@ def test_blank_value_is_treated_as_missing(monkeypatch):
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        ("true", True), ("True", True), ("TRUE", True), ("1", True),
-        ("yes", True), ("on", True),
-        ("false", False), ("False", False), ("0", False),
-        ("no", False), ("off", False),
+        ("true", True),
+        ("True", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
     ],
 )
 def test_secure_parses_common_boolean_spellings(monkeypatch, raw, expected):
