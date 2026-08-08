@@ -291,6 +291,17 @@ def run_load(
             encode_title_id=encode_title_id,
         )
 
+        # Ground truth is written BEFORE the bulk load, not after.
+        #
+        # Written last, an interrupted load leaves the PREVIOUS run's ground truth beside
+        # the new run's data. That pairing is silently wrong rather than obviously broken:
+        # anything deriving incident windows from the file looks in the wrong date range,
+        # finds nothing, and reports "no anomalies" -- healthy-looking output from a
+        # corrupt input. Writing it first means an interruption leaves ground truth that
+        # matches the data as far as the data got, and the row counts show the shortfall.
+        progress(f"writing ground truth to {ground_truth_path}...")
+        write_ground_truth(incidents, ground_truth_path, seed=seed, days=days)
+
         progress(f"loading {len(titles)} titles...")
         _insert(client, "titles", _title_rows(titles), _TITLES_COLUMNS)
 
@@ -316,9 +327,6 @@ def run_load(
             batch_size=batch_size,
         )
         _load_playback_events(client, batches, progress)
-
-        progress(f"writing ground truth to {ground_truth_path}...")
-        write_ground_truth(incidents, ground_truth_path, seed=seed, days=days)
 
         row_counts = _row_counts(client, REPORTED_TABLES)
     finally:
