@@ -77,6 +77,22 @@ All four verified against the real project and real credentials, not documentati
 
 Install with the extra: `google-adk[mcp]`.
 
+### Two ADK APIs that look current but are not
+
+**Use `google.adk.workflow.Workflow`, not `SequentialAgent`.** `SequentialAgent` is
+deprecated in 2.6.3 and will be removed. `Workflow` is a graph API (`Node`, `Edge`,
+`FunctionNode`, `JoinNode`, `START`, `RetryConfig`, `NodeTimeoutError`), is not behind an
+experimental gate, and verified working with `LlmAgent` nodes, tool-calling loops,
+`after_tool_callback` and `output_schema` validation. Note: building an agent into a
+`Workflow` **clones** it, so graph nodes are not the original instances — do not compare
+node identity against a pre-build agent object. Stages are reachable via
+`pipeline.graph.nodes` (which includes the `START` sentinel), not `sub_agents`.
+
+**Use `GOOGLE_GENAI_USE_ENTERPRISE`, not `GOOGLE_GENAI_USE_VERTEXAI`.** The old name still
+works but raises a `DeprecationWarning` on every agent construction. Between that and
+`SequentialAgent`, one test run emitted 345 warnings; fixing both took it to 6. The rename
+tracks Vertex AI's rebrand to the Gemini Enterprise Agent Platform.
+
 **`GOOGLE_CLOUD_LOCATION` must be `global`.** With `us-central1` every call returns
 404 NOT_FOUND for a model that only serves globally. `.env` is gitignored, so
 `tests/test_env_completeness.py` guards against it drifting behind `.env.example`.

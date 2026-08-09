@@ -5,7 +5,7 @@ swapping the model: ``LlmAgent.model`` is typed ``Union[str, BaseLlm]``, so an
 ``LlmAgent`` built with a ``FakeLlm`` instance is indistinguishable, from ADK's
 point of view, from one built with the real Gemini model -- it never imports or
 calls ``google.genai``'s network client. This is what lets
-``tests/agent/test_agents.py`` drive the real ``SequentialAgent`` pipeline,
+``tests/agent/test_agents.py`` drive the real ``Workflow`` pipeline,
 through the real ADK function-calling and ``output_schema`` validation flow,
 without ever making a model call.
 

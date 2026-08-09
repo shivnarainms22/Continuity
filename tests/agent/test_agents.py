@@ -1,4 +1,4 @@
-"""Tests for continuity.agent.agents: the stage builders, the SequentialAgent
+"""Tests for continuity.agent.agents: the stage builders, the Workflow
 pipeline, the audit log, and the ACT approval gate.
 
 Two kinds of test:
@@ -19,6 +19,12 @@ Two kinds of test:
   `continuity.agent.tools` primitives) -- sub-project 2 already tests the
   primitives' own correctness; what these tests prove is the WIRING: tool
   registration, stage order, output_schema enforcement, and the audit log.
+
+`build_investigation_pipeline` returns a `google.adk.workflow.Workflow`, not
+the deprecated `SequentialAgent` -- `_stage_nodes` below reads the four
+`LlmAgent` stage nodes back off `pipeline.graph.nodes` in declared order,
+filtering out the graph's `START` sentinel, since `Workflow` has no
+`sub_agents` attribute.
 """
 
 from __future__ import annotations
@@ -28,10 +34,11 @@ import json
 
 import pydantic
 import pytest
-from google.adk.agents import SequentialAgent
+from google.adk.agents import LlmAgent
 from google.adk.runners import InMemoryRunner
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
+from google.adk.workflow import START, Workflow
 from google.genai import types
 
 from continuity.agent.agents import (
@@ -77,6 +84,13 @@ def _fake_clickhouse_config() -> ClickHouseConfig:
         host="localhost", port=8123, user="default", password="x", database="continuity",
         secure=False,
     )
+
+
+def _stage_nodes(pipeline: Workflow) -> list[LlmAgent]:
+    """The four LlmAgent stage nodes off `pipeline.graph.nodes`, in declared
+    order, with the graph's `START` sentinel filtered out -- `Workflow` has no
+    `sub_agents` attribute the way `SequentialAgent` did."""
+    return [node for node in pipeline.graph.nodes if node.name != START.name]
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +146,7 @@ def test_select_tools_raises_naming_every_available_tool_on_a_missing_name(real_
 
 def test_each_stage_has_its_own_typed_output_schema_and_key(real_tools):
     pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
-    investigate, correlate, quantify, brief = pipeline.sub_agents
+    investigate, correlate, quantify, brief = _stage_nodes(pipeline)
 
     assert (investigate.output_schema.__name__, investigate.output_key) == (
         "InvestigationResult",
@@ -157,8 +171,8 @@ def test_each_stage_has_its_own_typed_output_schema_and_key(real_tools):
 def test_pipeline_declares_stages_in_the_documented_order(real_tools):
     pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
 
-    assert isinstance(pipeline, SequentialAgent)
-    assert [a.name for a in pipeline.sub_agents] == [
+    assert isinstance(pipeline, Workflow)
+    assert [a.name for a in _stage_nodes(pipeline)] == [
         "investigate",
         "correlate",
         "quantify",
@@ -168,25 +182,25 @@ def test_pipeline_declares_stages_in_the_documented_order(real_tools):
 
 def test_act_is_not_a_pipeline_sub_agent(real_tools):
     """ACT sits behind an explicit approval gate (`propose_action`) that the
-    pipeline never crosses on its own -- it must not be one of the sub-agents
+    pipeline never crosses on its own -- it must not be one of the stage nodes
     that runs automatically."""
     pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
 
-    assert "act" not in [a.name for a in pipeline.sub_agents]
+    assert "act" not in [a.name for a in _stage_nodes(pipeline)]
 
 
 def test_model_is_injectable_as_a_fake_base_llm_on_every_stage(real_tools):
     fake = FakeLlm(model="fake-shared")
     pipeline, _audit_log = build_investigation_pipeline(real_tools, model=fake)
 
-    assert all(agent.model is fake for agent in pipeline.sub_agents)
+    assert all(agent.model is fake for agent in _stage_nodes(pipeline))
 
 
 def test_pipeline_construction_needs_no_credentials_or_env_vars(real_tools, monkeypatch):
     for var in (
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_LOCATION",
-        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
         "GOOGLE_API_KEY",
         "CLICKHOUSE_HOST",
         "CLICKHOUSE_PASSWORD",
@@ -195,7 +209,7 @@ def test_pipeline_construction_needs_no_credentials_or_env_vars(real_tools, monk
 
     pipeline, audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
 
-    assert isinstance(pipeline, SequentialAgent)
+    assert isinstance(pipeline, Workflow)
     assert audit_log.entries == []
 
 
@@ -221,7 +235,7 @@ def test_mcp_toolset_is_attached_only_to_investigate(real_tools):
     pipeline, _audit_log = build_investigation_pipeline(
         real_tools, model="gemini-3.6-flash", mcp_toolset=toolset
     )
-    investigate, correlate, quantify, brief = pipeline.sub_agents
+    investigate, correlate, quantify, brief = _stage_nodes(pipeline)
 
     assert toolset in investigate.tools
     assert toolset not in correlate.tools
@@ -432,7 +446,7 @@ _BRIEF_JSON = json.dumps(
 )
 
 
-def _build_scripted_pipeline() -> tuple[SequentialAgent, AuditLog, dict[str, FakeLlm]]:
+def _build_scripted_pipeline() -> tuple[Workflow, AuditLog, dict[str, FakeLlm]]:
     """A full four-stage pipeline wired to test-local stub tools and one FakeLlm
     per stage, scripted to a consistent, valid happy-path investigation."""
     audit_log = AuditLog()
@@ -505,9 +519,9 @@ def _build_scripted_pipeline() -> tuple[SequentialAgent, AuditLog, dict[str, Fak
     brief_model = FakeLlm(model="fake-brief", responses=[scripted_final_text(_BRIEF_JSON)])
     brief = build_brief_agent(model=brief_model)
 
-    pipeline = SequentialAgent(
+    pipeline = Workflow(
         name="continuity_investigation_under_test",
-        sub_agents=[investigate, correlate, quantify, brief],
+        edges=[(START, investigate, correlate, quantify, brief)],
     )
     models = {
         "investigate": investigate_model,
@@ -518,7 +532,7 @@ def _build_scripted_pipeline() -> tuple[SequentialAgent, AuditLog, dict[str, Fak
     return pipeline, audit_log, models
 
 
-async def _run_pipeline(pipeline: SequentialAgent):
+async def _run_pipeline(pipeline: Workflow):
     runner = InMemoryRunner(agent=pipeline, app_name="test_app")
     session = await runner.session_service.create_session(app_name="test_app", user_id="u1")
     content = types.Content(role="user", parts=[types.Part(text="investigate")])
@@ -676,7 +690,7 @@ async def test_a_stage_output_that_fails_schema_validation_is_raised_not_propaga
         model=bad_model,
         audit_log=audit_log,
     )
-    pipeline = SequentialAgent(name="bad_pipeline", sub_agents=[investigate])
+    pipeline = Workflow(name="bad_pipeline", edges=[(START, investigate)])
 
     with pytest.raises(pydantic.ValidationError):
         await _run_pipeline(pipeline)

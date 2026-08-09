@@ -1,10 +1,28 @@
-"""The agent definitions: one ``LlmAgent`` per stage, wired into a ``SequentialAgent``.
+"""The agent definitions: one ``LlmAgent`` per stage, wired into a ``Workflow``.
 
 DETECT is deterministic (``continuity.analysis.detect``, no LLM -- see CLAUDE.md hard
 constraint 4) and is not built here; it runs before this pipeline and its result (a
 metric, window, and slice) is the pipeline's input. This module builds the four
-judgement stages -- INVESTIGATE, CORRELATE, QUANTIFY, BRIEF -- as one
-``SequentialAgent``, plus ``propose_action``, the ACT stage's approval gate.
+judgement stages -- INVESTIGATE, CORRELATE, QUANTIFY, BRIEF -- as one linear
+``google.adk.workflow.Workflow`` graph (``START -> investigate -> correlate ->
+quantify -> brief``), plus ``propose_action``, the ACT stage's approval gate.
+
+WHY ``Workflow`` AND NOT ``SequentialAgent``. ``google.adk.agents.SequentialAgent``
+is deprecated in ADK 2.6.3 ("SequentialAgent is deprecated in favor of Workflow and
+will be removed in a future version") and its own module has been verified to still
+support an ``LlmAgent`` as a workflow node end to end (tool-calling loop,
+``output_schema`` validation, and ``after_tool_callback`` all work identically inside
+a ``Workflow`` node). All four of THIS module's stages remain ``LlmAgent`` --
+none of them are deterministic. The two deterministic computations the hackathon
+brief is thinking of when it says "measurement nodes and judgement nodes" already
+live outside this module's stage graph: DETECT is a separate caller-driven step (see
+above) in ``continuity.analysis``, and every number QUANTIFY reports comes from the
+``quantify_impact`` ``FunctionTool`` (``continuity.agent.tools``) that the QUANTIFY
+``LlmAgent`` calls -- not a pipeline stage of its own. So no stage in
+``build_investigation_pipeline`` becomes a ``FunctionNode``: doing so here would mean
+either inventing a node that duplicates logic that already lives in ``tools.py``
+(out of this module's scope to touch) or replacing a stage's LLM judgement with code,
+which is not what CORRELATE/QUANTIFY/BRIEF do.
 
 Every stage's tools come from ``continuity.agent.tools.build_function_tools`` (the
 five analysis primitives) -- this module only decides which of those five tools go to
@@ -38,11 +56,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from google.adk.agents import LlmAgent, SequentialAgent
+from google.adk.agents import LlmAgent
 from google.adk.models.base_llm import BaseLlm
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from google.adk.workflow import START, Workflow
 from mcp import StdioServerParameters
 
 from continuity.agent.schemas import (
@@ -399,9 +418,10 @@ def build_investigation_pipeline(
     model: Model = DEFAULT_MODEL_ID,
     mcp_toolset: McpToolset | None = None,
     name: str = "continuity_investigation",
-) -> tuple[SequentialAgent, AuditLog]:
-    """Wires INVESTIGATE -> CORRELATE -> QUANTIFY -> BRIEF into one `SequentialAgent`,
-    sharing one `AuditLog` across all of them.
+) -> tuple[Workflow, AuditLog]:
+    """Wires INVESTIGATE -> CORRELATE -> QUANTIFY -> BRIEF into one linear `Workflow`
+    graph (`START -> investigate -> correlate -> quantify -> brief`), sharing one
+    `AuditLog` across all of them.
 
     `tools` is the five-tool list `continuity.agent.tools.build_function_tools(gateway)`
     returns; this function only decides which of those five go to which stage
@@ -410,6 +430,14 @@ def build_investigation_pipeline(
     gateway in tests, since binding a gateway never calls it). ACT is deliberately NOT
     included here: it sits behind an explicit approval gate (`propose_action`) that
     this pipeline never crosses on its own.
+
+    `Workflow` (not the deprecated `SequentialAgent`) is what actually runs an
+    `LlmAgent` per stage -- see the module docstring for why no stage here becomes a
+    `FunctionNode`. Each `LlmAgent` is cloned when the graph is built (ADK's own
+    `Workflow` construction behavior for an `LlmAgent` node), but `tools`, `model`,
+    `output_schema` and `output_key` are preserved by reference on the clone, so every
+    invariant the four `build_*_agent` functions establish still holds on the graph's
+    nodes.
     """
     audit_log = AuditLog()
     investigate = build_investigate_agent(
@@ -425,9 +453,7 @@ def build_investigation_pipeline(
         select_tools(tools, QUANTIFY_TOOL_NAMES), model=model, audit_log=audit_log
     )
     brief = build_brief_agent(model=model)
-    pipeline = SequentialAgent(
-        name=name, sub_agents=[investigate, correlate, quantify, brief]
-    )
+    pipeline = Workflow(name=name, edges=[(START, investigate, correlate, quantify, brief)])
     return pipeline, audit_log
 
 
