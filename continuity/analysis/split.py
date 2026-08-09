@@ -45,6 +45,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from statistics import median
 from typing import Any
 
 from continuity.analysis.metrics import Metric
@@ -183,9 +184,7 @@ def rank_contributions(
         final_note = note
         if contribution is not None:
             if single_value:
-                final_note = (
-                    "only one usable value for this dimension -- no information gained"
-                )
+                final_note = "only one usable value for this dimension -- no information gained"
             elif total_contribution == 0:
                 final_note = "zero net deviation across values -- share of deviation is undefined"
             else:
@@ -239,8 +238,7 @@ def _weight_sql(metric: Metric, *, raw_events: bool) -> str:
         rollup_expr, raw_expr = _WEIGHT_SQL[metric.name]
     except KeyError:
         raise ValueError(
-            f"No weighting rule defined for metric {metric.name!r}. "
-            f"Known: {sorted(_WEIGHT_SQL)}"
+            f"No weighting rule defined for metric {metric.name!r}. Known: {sorted(_WEIGHT_SQL)}"
         ) from None
     return raw_expr if raw_events else rollup_expr
 
@@ -392,6 +390,125 @@ async def split_dimensions(
     for dimension in dimensions:
         measurements = _rows_to_measurements(
             window_by_dim.get(dimension, []), baseline_by_dim.get(dimension, [])
+        )
+        values = rank_contributions(
+            measurements,
+            dimension=dimension,
+            higher_is_worse=metric.higher_is_worse,
+            sql=sql,
+            baseline_sql=baseline_sql,
+        )
+        results[dimension] = SplitResult(
+            dimension=dimension,
+            values=values,
+            informative=is_informative(measurements),
+            sql=sql,
+            baseline_sql=baseline_sql,
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Robust baseline: median of SEVERAL comparison windows, not one.
+#
+# The functions above compare against a single `baseline_window` (same hours, N days
+# earlier). That is fragile for the same reason mean/sigma was rejected in baseline.py:
+# if that one window happens to contain an incident, every contribution computed from
+# it is wrong. With three planted incidents in 56 days that is a live possibility, not
+# a hypothetical (see docs/superpowers/plans/2026-08-08-continuity-02-analysis-core.md,
+# "Carried forward into Task 8"). `walk.py` (the greedy drill-down) uses this variant
+# exclusively; the single-window functions above are unchanged and keep their own tests.
+# ---------------------------------------------------------------------------
+
+
+def _median_baseline_value(
+    value: str, baseline_by_value_per_window: Sequence[dict[str, dict[str, Any]]]
+) -> float | None:
+    """Median `metric_value` for `value` across several baseline windows.
+
+    Windows where `value` has no data are skipped, not treated as zero -- `None` only
+    when EVERY window lacks it, matching `_rows_to_measurements`'s "absent from the
+    baseline period" contract.
+    """
+    values = [
+        v
+        for by_value in baseline_by_value_per_window
+        if (row := by_value.get(value)) is not None
+        and (v := _to_float_or_none(row.get("metric_value"))) is not None
+    ]
+    return median(values) if values else None
+
+
+def _rows_to_measurements_median_baseline(
+    window_rows: list[dict[str, Any]], baseline_rows_per_window: Sequence[list[dict[str, Any]]]
+) -> list[ValueMeasurement]:
+    """Like `_rows_to_measurements`, but `baseline_value` is the MEDIAN across several
+    comparison windows rather than one -- see the section docstring above."""
+    baseline_by_value_per_window = [
+        {str(row["value"]): row for row in rows} for rows in baseline_rows_per_window
+    ]
+    measurements: list[ValueMeasurement] = []
+    for row in window_rows:
+        value = str(row["value"])
+        measurements.append(
+            ValueMeasurement(
+                value=value,
+                metric_value=_to_float_or_none(row.get("metric_value")),
+                baseline_value=_median_baseline_value(value, baseline_by_value_per_window),
+                weight=_to_float_or_none(row.get("weight")) or 0.0,
+            )
+        )
+    return measurements
+
+
+async def split_dimensions_median_baseline(
+    gateway: ClickHouseMCPGateway,
+    *,
+    slice_: Slice,
+    metric: Metric,
+    dimensions: Sequence[str],
+    window: tuple[datetime, datetime],
+    baseline_windows: Sequence[tuple[datetime, datetime]],
+) -> dict[str, SplitResult]:
+    """Split `slice_` on MANY dimensions against a ROBUST baseline: the MEDIAN of
+    several comparison windows (typically the same weekday/time-of-day over the
+    preceding `lookback_weeks` weeks, matching baseline.py's week-over-week convention)
+    rather than one -- see the module-level section docstring above for why.
+
+    Issues `1 + len(baseline_windows)` queries total, each still batched across every
+    dimension in one UNION ALL (per Task 1's benchmark: batching all dimensions into
+    one query measured at 43ms versus 183ms issued one at a time) -- never one query
+    per dimension.
+    """
+    if not dimensions:
+        raise ValueError("dimensions must be non-empty")
+    for dimension in dimensions:
+        _validate_dimension(dimension)
+    _validate_window(window)
+    if not baseline_windows:
+        raise ValueError("baseline_windows must be non-empty")
+    for baseline_window in baseline_windows:
+        _validate_window(baseline_window)
+
+    sql = _build_batched_split_sql(slice_, metric, dimensions, window)
+    baseline_sqls = [
+        _build_batched_split_sql(slice_, metric, dimensions, bw) for bw in baseline_windows
+    ]
+    window_result = await gateway.query(sql)
+    baseline_results = [await gateway.query(baseline_sql) for baseline_sql in baseline_sqls]
+
+    window_by_dim = _group_by_dim(window_result.rows)
+    baseline_by_dim_per_window = [_group_by_dim(r.rows) for r in baseline_results]
+    # Provenance carries every baseline query that fed the median, not just one.
+    baseline_sql = "\n-- UNION (median across windows) --\n".join(baseline_sqls)
+
+    results: dict[str, SplitResult] = {}
+    for dimension in dimensions:
+        baseline_rows_per_window = [
+            by_dim.get(dimension, []) for by_dim in baseline_by_dim_per_window
+        ]
+        measurements = _rows_to_measurements_median_baseline(
+            window_by_dim.get(dimension, []), baseline_rows_per_window
         )
         values = rank_contributions(
             measurements,
