@@ -19,7 +19,15 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from continuity.analysis.baseline import Baseline, BaselineStatus, ComparisonMode
+from continuity.analysis.baseline import (
+    Baseline,
+    BaselineStatus,
+    ComparisonMode,
+    Direction,
+    compute_baseline,
+    is_anomalous,
+    select_week_over_week_window,
+)
 from continuity.analysis.detect import (
     DEFAULT_MODE,
     BucketLabel,
@@ -373,6 +381,50 @@ def test_fetch_window_start_floors_to_midnight_n_days_before():
 
 def test_default_mode_is_week_over_week():
     assert DEFAULT_MODE is ComparisonMode.WEEK_OVER_WEEK
+
+
+def test_label_buckets_week_over_week_pools_spread_and_does_not_flag_a_trivial_move():
+    """Direct replacement for the measured false positive: a tight 4-point level
+    window (MAD ~0) makes a trivial move read as a huge z if the spread is taken from
+    those same 4 points. Pooling the spread from the +/-30 minute neighbourhood
+    (wired through label_buckets under WEEK_OVER_WEEK) must classify this NORMAL --
+    while the pre-pooling calculation on the same 4 points alone would have crossed
+    the anomaly threshold, proving this is the fix and not a blind detector."""
+    target = datetime(2026, 6, 13, 21, 0)  # a Saturday
+    assert target.weekday() == 5
+    noise_cycle = [-2.0, 2.0, -1.5, 1.5, -2.5, 2.5, -1.0, 1.0, -1.8, 1.8, -0.5, 0.5]
+    tight_cluster = [99.9, 100.0, 100.0, 100.1]  # the pathological narrow 4-point level
+
+    observations: list[tuple[datetime, float]] = []
+    for week in range(1, 5):
+        day = target - timedelta(weeks=week)
+        for offset in range(-6, 7):
+            ts = day + timedelta(minutes=5 * offset)
+            if offset == 0:
+                value = tight_cluster[week - 1]
+            else:
+                value = 100.0 + noise_cycle[(offset + 6 + week) % len(noise_cycle)]
+            observations.append((ts, value))
+    # A trivial move, not a real incident.
+    observations.append((target, 100.5))
+
+    labels = label_buckets(
+        observations,
+        start=target,
+        end=target + timedelta(minutes=5),
+        metric=get_metric("rebuffer"),
+    )
+    assert len(labels) == 1
+    label = labels[0]
+    assert label.baseline.status is BaselineStatus.OK
+    assert label.status is BucketStatus.NORMAL
+
+    # Prove it: the pre-pooling calculation on the same 4 level points alone would
+    # have crossed the anomaly threshold on this exact move.
+    naive_comparison = select_week_over_week_window(observations, target, lookback_weeks=4)
+    naive_baseline = compute_baseline(100.5, naive_comparison)
+    assert naive_baseline.status is BaselineStatus.OK
+    assert is_anomalous(naive_baseline, direction=Direction.HIGHER_IS_WORSE, threshold=3.0) is True
 
 
 def test_label_buckets_defaults_to_week_over_week_and_ignores_trailing_day_only_history():

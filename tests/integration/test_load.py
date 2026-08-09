@@ -52,6 +52,49 @@ def config() -> ClickHouseConfig:
     return dataclasses.replace(ClickHouseConfig.from_env(), database=_TEST_DATABASE)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _working_database_must_be_untouched():
+    """Fail loudly if anything in this file writes to the working database.
+
+    Every test here truncates and reloads. Twice now a path escaped the isolation (first
+    the in-process config, then a CLI subprocess inheriting os.environ) and destroyed a
+    fully loaded dataset, and BOTH times the suite reported all-green -- the assertions
+    were satisfied by the toy data the leak had just written.
+
+    Comparing the working database's row count across the module turns that silent
+    destruction into a failure that names itself.
+    """
+    working = ClickHouseConfig.from_env()
+    if working.database == _TEST_DATABASE:
+        pytest.fail(
+            f"CLICKHOUSE_DATABASE is set to {_TEST_DATABASE!r}, so this guard cannot "
+            "distinguish the working database from the test one."
+        )
+
+    def count() -> int | None:
+        client = clickhouse_connect.get_client(
+            host=working.host, port=working.port, username=working.user,
+            password=working.password, database=working.database, secure=working.secure,
+        )
+        try:
+            return int(client.query("SELECT count() FROM playback_events").result_rows[0][0])
+        except Exception:
+            return None  # table absent is fine; there is simply nothing to protect
+        finally:
+            client.close()
+
+    before = count()
+    yield
+    after = count()
+    if before is not None and after != before:
+        pytest.fail(
+            f"tests in this file changed the WORKING database {working.database!r}: "
+            f"playback_events went from {before:,} to {after:,} rows. Something bypassed "
+            f"the {_TEST_DATABASE!r} isolation -- check for a subprocess inheriting "
+            "os.environ, or a config built from the environment rather than the fixture."
+        )
+
+
 @pytest.fixture
 def ch_client(config: ClickHouseConfig):
     client = clickhouse_connect.get_client(
@@ -66,6 +109,24 @@ def ch_client(config: ClickHouseConfig):
         yield client
     finally:
         client.close()
+
+
+def _subprocess_env(**overrides: str) -> dict[str, str]:
+    """Environment for a CLI subprocess, pinned to the dedicated test database.
+
+    The in-process fixture isolates via dataclasses.replace on the config object, which a
+    SUBPROCESS never sees: it builds its own config from .env and would target the working
+    database. That gap destroyed a fully loaded 63.85M-row dataset twice, and both times
+    the suite reported all-green because every assertion in this file was satisfied by the
+    toy dataset it had just written.
+
+    Passing os.environ straight through to a subprocess that runs with --truncate is the
+    bug. Always build the environment here.
+    """
+    env = dict(os.environ)
+    env["CLICKHOUSE_DATABASE"] = _TEST_DATABASE
+    env.update(overrides)
+    return env
 
 
 def _count(ch_client, table: str) -> int:
@@ -275,8 +336,7 @@ def test_bad_config_fails_loudly_instead_of_reporting_success(tmp_path):
 
 
 def test_cli_exits_nonzero_and_prints_failure_on_bad_credentials(tmp_path):
-    env = dict(os.environ)
-    env["CLICKHOUSE_PASSWORD"] = "definitely-wrong"
+    env = _subprocess_env(CLICKHOUSE_PASSWORD="definitely-wrong")
     result = subprocess.run(
         [
             sys.executable,
@@ -337,7 +397,7 @@ def test_cli_runs_end_to_end_with_a_small_dataset(config, ch_client, tmp_path):
             str(tmp_path / "ground_truth.json"),
         ],
         cwd=Path(__file__).resolve().parents[2],
-        env=os.environ,
+        env=_subprocess_env(),
         capture_output=True,
         text=True,
         timeout=120,

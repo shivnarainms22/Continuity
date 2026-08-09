@@ -33,6 +33,7 @@ from enum import Enum
 from continuity.analysis.baseline import (
     DEFAULT_LOOKBACK_WEEKS,
     DEFAULT_MIN_OBSERVATIONS,
+    DEFAULT_NEIGHBOURHOOD_RADIUS,
     DEFAULT_TRAILING_DAYS,
     Baseline,
     BaselineStatus,
@@ -41,6 +42,7 @@ from continuity.analysis.baseline import (
     compute_baseline,
     is_anomalous,
     select_comparison_window,
+    select_neighbourhood_residuals,
     select_week_over_week_window,
 )
 from continuity.analysis.metrics import Metric, get_metric
@@ -59,6 +61,13 @@ DEFAULT_THRESHOLD = 3.0
 # Week-over-week is the default comparison strategy -- see the module docstring for why
 # trailing-days alone is wrong for metrics with weekly structure (bitrate, errors).
 DEFAULT_MODE = ComparisonMode.WEEK_OVER_WEEK
+
+# Under WEEK_OVER_WEEK, the SPREAD (MAD) is pooled from a +/-DEFAULT_NEIGHBOURHOOD_RADIUS
+# bucket time-of-day neighbourhood (see baseline.py's module docstring) instead of the
+# lookback_weeks (4) raw comparison points alone -- 4 points is too few and produces
+# false-positive z-scores of double digits on trivial moves when they happen to cluster
+# tightly. TRAILING_DAYS is unaffected; it keeps computing MAD from its own comparison
+# window, exactly as before.
 
 # A single 5-minute blip is noise. Three consecutive anomalous buckets (15 minutes) is
 # the shortest run that separated the planted incidents from noise on this dataset.
@@ -218,12 +227,17 @@ def label_buckets(
     lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
     threshold: float = DEFAULT_THRESHOLD,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
+    neighbourhood_radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
 ) -> list[BucketLabel]:
     """Classify every 5-minute bucket in [start, end) as ANOMALOUS, NORMAL or UNKNOWN.
 
     A bucket absent from `observations` (no rows for that 5-minute interval, e.g. a
     thin slice with no traffic) is treated as a missing actual, which `compute_baseline`
     already turns into INSUFFICIENT_DATA -> UNKNOWN rather than a false "normal".
+
+    Under `ComparisonMode.WEEK_OVER_WEEK` the SPREAD is pooled from a time-of-day
+    neighbourhood (`select_neighbourhood_residuals`, see baseline.py) rather than the
+    same handful of points the LEVEL comes from -- `TRAILING_DAYS` is unaffected.
     """
     by_bucket = dict(observations)
     direction = _direction_for(metric)
@@ -237,7 +251,19 @@ def label_buckets(
             trailing_days=trailing_days,
             lookback_weeks=lookback_weeks,
         )
-        result = compute_baseline(actual, comparison, min_observations=min_observations)
+        spread_values = (
+            select_neighbourhood_residuals(
+                observations,
+                bucket,
+                lookback_weeks=lookback_weeks,
+                radius=neighbourhood_radius,
+            )
+            if mode is ComparisonMode.WEEK_OVER_WEEK
+            else None
+        )
+        result = compute_baseline(
+            actual, comparison, spread_values=spread_values, min_observations=min_observations
+        )
         if result.status is BaselineStatus.INSUFFICIENT_DATA:
             status = BucketStatus.UNKNOWN
         elif is_anomalous(result, direction=direction, threshold=threshold):
@@ -351,6 +377,7 @@ def detect_from_series(
     min_run_length: int = DEFAULT_MIN_RUN_LENGTH,
     max_gap: int = DEFAULT_MAX_GAP,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
+    neighbourhood_radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
 ) -> DetectionResult:
     """Pure detection over an already-fetched series. No I/O -- `detect()` below is the
     only function that touches the gateway; this is what tests/analysis/test_detect.py
@@ -366,6 +393,7 @@ def detect_from_series(
         lookback_weeks=lookback_weeks,
         threshold=threshold,
         min_observations=min_observations,
+        neighbourhood_radius=neighbourhood_radius,
     )
     direction = _direction_for(metric)
     groups = group_windows(labels, min_run_length=min_run_length, max_gap=max_gap)
@@ -406,6 +434,7 @@ async def detect(
     min_run_length: int = DEFAULT_MIN_RUN_LENGTH,
     max_gap: int = DEFAULT_MAX_GAP,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
+    neighbourhood_radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
 ) -> DetectionResult:
     """Fetch the series through the MCP gateway (one query) and detect anomaly windows
     over [start, end). This is the only function in this module that performs I/O."""
@@ -429,4 +458,5 @@ async def detect(
         min_run_length=min_run_length,
         max_gap=max_gap,
         min_observations=min_observations,
+        neighbourhood_radius=neighbourhood_radius,
     )

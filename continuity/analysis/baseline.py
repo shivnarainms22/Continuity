@@ -26,6 +26,21 @@ Either way, baseline = the MEDIAN of the selected comparison values. Spread = MA
 (median absolute deviation), scaled by 1.4826 so it estimates sigma under normality.
 Robust z = (actual - median) / (1.4826 * MAD).
 
+The LEVEL (median) is always the same-(weekday, time-of-day) comparison window above --
+that is what removes seasonality and it works. The SPREAD, if computed from those same
+`lookback_weeks` (4) points alone, is too few: when they happen to cluster tightly, MAD
+is tiny and a trivial absolute move produces a huge z (measured on the real dataset: a
+quiet 5-day period with rebuffer moving from ~0.04% to ~0.06% of watch time produced
+z as high as 14). `select_neighbourhood_residuals` pools the spread sample over a
+time-of-day NEIGHBOURHOOD (+/- `radius` buckets) on the same weekdays instead -- up to
+`(2 * radius + 1) * lookback_weeks` points rather than `lookback_weeks`. Because
+QoE genuinely varies across that neighbourhood (the shoulders of the evening peak are
+not the same level as its centre), each neighbourhood slot's OWN week-over-week median
+is subtracted before pooling, so the pooled sample measures dispersion around the
+seasonal curve, not the diurnal slope itself. See
+`test_select_neighbourhood_residuals_reflects_noise_not_the_diurnal_slope` for the proof
+(and the naive-MAD failure it guards against).
+
 Median and MAD rather than mean and standard deviation, deliberately: a real
 incident sitting in the comparison window inflates a mean/sigma baseline and can
 mask the next incident. A detector that goes blind after one incident is
@@ -49,6 +64,22 @@ _MAD_TO_SIGMA = 1.4826
 DEFAULT_TRAILING_DAYS = 7
 DEFAULT_LOOKBACK_WEEKS = 4
 DEFAULT_MIN_OBSERVATIONS = 4
+# +/- 24 buckets at 5 minutes/bucket = a +/-2 hour time-of-day neighbourhood. A +/-30
+# minute neighbourhood (radius=6) already pools 13 * lookback_weeks points and helps,
+# but measured on the real 63.85M-row dataset it was not always enough: with n=4 per
+# slot, each slot's own-median centring has an inherent small-sample bias (the two
+# middle-ranked values get near-zero residuals, the two extreme ones get large ones),
+# and that bias does not average away by pooling more copies of the same 4-point
+# shape -- it needs slots spread wide enough that the bulk of the neighbourhood's
+# diurnal shape genuinely differs, not just more repeats of the same shape. +/-2 hours
+# was the smallest radius that reliably cleared every measured false positive on a
+# quiet 5-day period (see tests/integration/test_detect_real.py) while leaving every
+# planted incident's peak z far above threshold.
+DEFAULT_NEIGHBOURHOOD_RADIUS = 24
+# The comparison-window functions above operate on 5-minute buckets throughout this
+# codebase (see detect.py's BUCKET_WIDTH); the neighbourhood pooling below needs the
+# same width to shift target-time-of-day by whole buckets.
+DEFAULT_BUCKET_WIDTH = timedelta(minutes=5)
 
 
 class ComparisonMode(Enum):
@@ -170,19 +201,90 @@ def select_week_over_week_window(
     return selected
 
 
+def select_neighbourhood_residuals(
+    observations: Sequence[tuple[datetime, float | None]],
+    target: datetime,
+    *,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
+    radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
+    bucket_width: timedelta = DEFAULT_BUCKET_WIDTH,
+) -> list[float]:
+    """Pooled spread sample for `target`'s bucket: residuals around the seasonal curve,
+    gathered from a time-of-day neighbourhood on the same weekday over `lookback_weeks`.
+
+    For each of the `2 * radius + 1` time-of-day slots at `target +/- k * bucket_width`
+    (`k` in `0..radius`) -- each selected exactly like `select_week_over_week_window`,
+    i.e. same weekday, `lookback_weeks` weeks back, target's own day excluded -- this
+    computes THAT SLOT's OWN week-over-week median first, then returns
+    `value - slot_median` for every observation in every slot.
+
+    Subtracting each slot's own median before pooling is the whole point: a slot half an
+    hour from `target` has a different expected LEVEL (QoE varies across a 30-minute
+    span, especially at the shoulders of the evening peak), so pooling raw neighbourhood
+    values would measure the diurnal slope, not the noise. Residuals measure dispersion
+    around the seasonal curve, independent of where on that curve each slot sits -- see
+    `test_select_neighbourhood_residuals_reflects_noise_not_the_diurnal_slope`.
+
+    A slot with no data yet (e.g. early in the dataset, before `lookback_weeks` of
+    history exists) contributes nothing rather than raising -- same "return fewer
+    values, never a fabricated one" contract as `select_week_over_week_window`. With
+    `radius=0` this reduces to exactly `select_week_over_week_window`'s own values
+    minus their shared median, i.e. the pre-pooling behaviour.
+
+    Indexes `observations` into a dict once up front rather than re-scanning the full
+    sequence for each of the `2 * radius + 1` slots (what repeatedly calling
+    `select_week_over_week_window` would cost): O(n) total instead of O(n * radius),
+    which matters because this runs once per bucket in `detect.py::label_buckets`.
+    """
+    if radius < 0:
+        raise ValueError(f"radius must be >= 0, got {radius}")
+    by_bucket = {ts: float(value) for ts, value in observations if not _is_missing(value)}
+    residuals: list[float] = []
+    for offset in range(-radius, radius + 1):
+        slot_target = target + offset * bucket_width
+        slot_date = slot_target.date()
+        slot_time = slot_target.time()
+        slot_values = [
+            by_bucket[dt]
+            for dt in (
+                datetime.combine(slot_date - timedelta(weeks=i), slot_time)
+                for i in range(1, lookback_weeks + 1)
+            )
+            if dt in by_bucket
+        ]
+        if not slot_values:
+            continue
+        slot_median = float(np.median(np.asarray(slot_values, dtype=float)))
+        residuals.extend(v - slot_median for v in slot_values)
+    return residuals
+
+
 def compute_baseline(
     actual: float | None,
     comparison_values: Sequence[float | None],
     *,
+    spread_values: Sequence[float | None] | None = None,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
 ) -> Baseline:
     """Median/MAD baseline and robust z-score for `actual` against `comparison_values`.
 
+    `spread_values`, if given, is a separate sample the SPREAD (MAD) is computed from --
+    typically `select_neighbourhood_residuals`'s pooled, per-slot-centred residuals,
+    which are a far more stable estimate than the handful of raw `comparison_values`
+    (see the module docstring). The LEVEL (median) and the `min_observations` gate are
+    always computed from `comparison_values` alone, regardless of how many
+    `spread_values` are available -- a wide, stable spread sample must never paper over
+    a level we could not actually establish. When `spread_values` is `None` (the
+    default), the MAD is computed from `comparison_values` itself, exactly as before --
+    this keeps `ComparisonMode.TRAILING_DAYS` and any direct caller byte-identical to
+    the pre-pooling behaviour.
+
     Returns `INSUFFICIENT_DATA` (never a numeric z) when:
     - `actual` is missing (None/NaN),
     - fewer than `min_observations` clean comparison values are available,
-    - MAD is 0 (a flat/thin trailing window) and `actual` differs from the
-      median, so the z-score would otherwise be a division by zero.
+    - MAD is 0 (a flat/thin trailing window, or a genuinely flat pooled spread) and
+      `actual` differs from the median, so the z-score would otherwise be a division
+      by zero.
 
     When MAD is 0 and `actual` equals the median exactly, the bucket is
     genuinely flat and `actual` fits it: that is `OK` with `z=0.0`, not an
@@ -211,7 +313,18 @@ def compute_baseline(
 
     arr = np.asarray(clean, dtype=float)
     median = float(np.median(arr))
-    mad = float(np.median(np.abs(arr - median)))
+
+    if spread_values is None:
+        spread_sample = arr
+    else:
+        spread_clean = [v for v in spread_values if not _is_missing(v)]
+        spread_sample = np.asarray(spread_clean, dtype=float)
+
+    if spread_sample.size == 0:
+        mad = 0.0
+    else:
+        spread_center = float(np.median(spread_sample))
+        mad = float(np.median(np.abs(spread_sample - spread_center)))
 
     if mad == 0.0:
         if actual == median:

@@ -13,8 +13,11 @@ Run:  uv run python scripts/benchmark_queries.py
 from __future__ import annotations
 
 import asyncio
+import json
 import statistics
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -22,9 +25,31 @@ from continuity.config import ClickHouseConfig
 from continuity.data.topology import DIMENSION_HIERARCHY
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway
 
-# The INC-APP-ROKU-820 window, from ground truth.
-WINDOW = ("2026-01-13 18:00:00", "2026-01-14 02:00:00")
+GROUND_TRUTH = Path("data/ground_truth.json")
 ROLLUP_DIMS = [d for d in DIMENSION_HIERARCHY if d != "title_id"]
+
+
+def incident_window() -> tuple[str, str]:
+    """Derive the benchmark window from ground truth rather than hardcoding dates.
+
+    This script previously pinned literal January dates. When incident placement moved
+    to be relative to the end of the window, those literals silently pointed at a period
+    containing no incident, and every GROUP BY returned zero rows -- while the latencies
+    still looked entirely plausible. Deriving means a stale artifact fails loudly instead.
+    """
+    if not GROUND_TRUTH.exists():
+        raise SystemExit(f"{GROUND_TRUTH} not found. Run the loader first.")
+    truth = json.loads(GROUND_TRUTH.read_text(encoding="utf-8"))
+    incident = next(i for i in truth["incidents"] if not i["is_decoy"])
+
+    def fmt(value: str) -> str:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+    return fmt(incident["start"]), fmt(incident["end"])
+
+
+WINDOW = ("", "")  # populated in main() once ground truth is read
 
 REBUFFER = "sum(rebuffer_ms) / nullIf(sum(watched_ms), 0)"
 
@@ -44,6 +69,9 @@ async def timed(gw, label: str, sql: str, repeats: int = 3) -> tuple[str, float,
 
 async def main() -> int:
     load_dotenv(override=False)
+    global WINDOW
+    WINDOW = incident_window()
+    print(f"benchmark window (from ground truth): {WINDOW[0]} -> {WINDOW[1]}")
     results: list[tuple[str, float, int]] = []
 
     async with ClickHouseMCPGateway(ClickHouseConfig.from_env()) as gw:

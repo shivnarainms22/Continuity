@@ -10,6 +10,7 @@ from continuity.analysis.baseline import (
     compute_baseline,
     is_anomalous,
     select_comparison_window,
+    select_neighbourhood_residuals,
     select_week_over_week_window,
 )
 
@@ -148,6 +149,91 @@ def test_select_week_over_week_window_rejects_non_positive_lookback_weeks():
 
 
 # ---------------------------------------------------------------------------
+# select_neighbourhood_residuals: pooled spread sample, centred per time-of-day slot.
+# ---------------------------------------------------------------------------
+
+
+def test_select_neighbourhood_residuals_pools_far_more_points_than_the_level_window():
+    """With radius=6 and 4 lookback weeks, up to 13 * 4 = 52 residuals -- not the 4
+    raw points the level window alone would give."""
+    target = datetime(2026, 8, 8, 21, 0)  # a Saturday
+    observations: list[tuple[datetime, float]] = []
+    for week in range(1, 5):
+        day = target - timedelta(weeks=week)
+        for offset in range(-6, 7):
+            observations.append((day + timedelta(minutes=5 * offset), 100.0 + offset))
+    residuals = select_neighbourhood_residuals(observations, target, lookback_weeks=4, radius=6)
+    assert len(residuals) == 13 * 4
+
+
+def test_select_neighbourhood_residuals_reflects_noise_not_the_diurnal_slope():
+    """The trap this function exists to avoid: a steep diurnal slope across the
+    +/-30 minute neighbourhood must not leak into the pooled spread -- only the (much
+    smaller) noise around each slot's own median should. A naive MAD of the RAW
+    (uncentred) neighbourhood values instead measures the slope -- assert that failure
+    mode too, so it is documented as the reason per-slot centring is required."""
+    target = datetime(2026, 8, 8, 21, 0)  # a Saturday
+    slope_per_bucket = 40.0  # steep: the neighbourhood spans +/-240 around its centre
+    noise_cycle = [-1.0, 1.0, -0.6, 0.6, -1.4, 1.4, -0.3, 0.3, -0.9, 0.9, -0.2, 0.2, -1.1, 1.1]
+
+    observations: list[tuple[datetime, float]] = []
+    for week in range(1, 5):
+        day = target - timedelta(weeks=week)
+        for offset in range(-6, 7):
+            noise = noise_cycle[(offset + 6 + week) % len(noise_cycle)]
+            value = 1000.0 + slope_per_bucket * offset + noise
+            observations.append((day + timedelta(minutes=5 * offset), value))
+
+    residuals = select_neighbourhood_residuals(observations, target, lookback_weeks=4, radius=6)
+    assert len(residuals) == 13 * 4
+
+    pooled_median = float(np.median(np.asarray(residuals)))
+    pooled_mad = float(np.median(np.abs(np.asarray(residuals) - pooled_median)))
+    pooled_spread = 1.4826 * pooled_mad
+
+    # Reflects the noise (amplitude ~1.4), nowhere near the slope's own scale.
+    assert pooled_spread < 5.0
+
+    # The trap: MAD of the raw, uncentred neighbourhood values instead measures the
+    # diurnal slope -- wildly inflated relative to the true noise level.
+    raw_values = [value for _, value in observations]
+    raw_median = float(np.median(np.asarray(raw_values)))
+    naive_mad = float(np.median(np.abs(np.asarray(raw_values) - raw_median)))
+    naive_spread = 1.4826 * naive_mad
+    assert naive_spread > 100.0
+    assert naive_spread > pooled_spread * 20
+
+
+def test_select_neighbourhood_residuals_with_zero_radius_matches_pre_pooling_deviations():
+    """radius=0 collapses to a single time-of-day slot -- the pre-pooling behaviour:
+    each value's own week-over-week median subtracted, i.e. exactly the deviations a
+    raw MAD over `select_week_over_week_window`'s own output would use."""
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = _series_at_same_time_of_day([7, 14, 21, 28])
+    level_values = select_week_over_week_window(observations, target, lookback_weeks=4)
+    median = float(np.median(np.asarray(level_values)))
+    expected = sorted(v - median for v in level_values)
+
+    residuals = select_neighbourhood_residuals(observations, target, lookback_weeks=4, radius=0)
+    assert sorted(residuals) == pytest.approx(expected)
+
+
+def test_select_neighbourhood_residuals_skips_slots_with_no_history():
+    """A slot with no matching observations (e.g. sparse data at some offsets)
+    contributes nothing rather than raising or fabricating a value."""
+    target = datetime(2026, 8, 8, 21, 0)
+    observations = _series_at_same_time_of_day([7, 14, 21, 28])  # only offset 0 populated
+    residuals = select_neighbourhood_residuals(observations, target, lookback_weeks=4, radius=6)
+    assert len(residuals) == 4  # only the offset-0 slot contributed
+
+
+def test_select_neighbourhood_residuals_rejects_negative_radius():
+    target = datetime(2026, 8, 8, 21, 0)
+    with pytest.raises(ValueError, match="radius"):
+        select_neighbourhood_residuals([], target, radius=-1)
+
+
+# ---------------------------------------------------------------------------
 # compute_baseline: the statistics, and every edge case that causes silent failure.
 # ---------------------------------------------------------------------------
 
@@ -240,6 +326,64 @@ def test_compute_baseline_is_insufficient_data_when_actual_is_nan():
 def test_compute_baseline_rejects_non_positive_min_observations():
     with pytest.raises(ValueError, match="min_observations"):
         compute_baseline(10.0, [1.0, 2.0], min_observations=0)
+
+
+# ---------------------------------------------------------------------------
+# compute_baseline with spread_values: the pooled-spread fix for tiny 4-point MAD.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_baseline_uses_spread_values_for_mad_instead_of_comparison_values():
+    """A tight 4-point comparison window would give a tiny MAD and a huge z on a
+    trivial move -- exactly the measured false positive. A wider, pooled
+    `spread_values` sample must be what the MAD actually comes from."""
+    comparison = [9.99, 10.0, 10.0, 10.01]  # tight cluster -> tiny naive MAD
+    pooled_spread_values = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]  # wide pooled residuals
+    actual = 10.06
+
+    naive = compute_baseline(actual, comparison)
+    pooled = compute_baseline(actual, comparison, spread_values=pooled_spread_values)
+
+    assert naive.status is BaselineStatus.OK
+    assert pooled.status is BaselineStatus.OK
+    assert is_anomalous(naive, direction=Direction.HIGHER_IS_WORSE, threshold=3.0) is True
+    assert is_anomalous(pooled, direction=Direction.HIGHER_IS_WORSE, threshold=3.0) is False
+    assert abs(pooled.z) < abs(naive.z)
+    # The LEVEL (expected) is unaffected by which sample the spread comes from.
+    assert pooled.expected == naive.expected == pytest.approx(10.0)
+
+
+def test_compute_baseline_min_observations_gates_on_level_even_with_a_large_spread_sample():
+    """Requirement: INSUFFICIENT_DATA still applies based on the LEVEL sample size,
+    regardless of how many pooled spread_values happen to be available."""
+    comparison = [10.0, 10.0]  # 2 < the default minimum of 4
+    pooled_spread_values = list(range(50))  # plenty of spread samples
+    result = compute_baseline(50.0, comparison, spread_values=pooled_spread_values)
+    assert result.status is BaselineStatus.INSUFFICIENT_DATA
+    assert result.sample_size == 2
+    assert result.z is None
+
+
+def test_compute_baseline_flat_pooled_spread_is_insufficient_not_infinite_or_zero():
+    """A genuinely flat pooled spread (MAD == 0) with a differing actual must remain
+    INSUFFICIENT_DATA -- never inf, never a silent 0.0 that reads as 'fine'."""
+    comparison = [10.0, 10.0, 10.0, 10.0]
+    result = compute_baseline(15.0, comparison, spread_values=[0.0, 0.0, 0.0])
+    assert result.status is BaselineStatus.INSUFFICIENT_DATA
+    assert result.z is None
+    assert result.z != float("inf")
+    assert result.z != 0.0
+
+
+def test_compute_baseline_empty_spread_values_falls_back_to_zero_mad_not_a_crash():
+    """If every neighbourhood slot happened to contribute nothing, spread_values is an
+    empty list -- must degrade to the same flat-window handling as MAD == 0, never a
+    crash or a fabricated spread."""
+    comparison = [10.0, 10.0, 10.0, 10.0]
+    result = compute_baseline(10.0, comparison, spread_values=[])
+    assert result.status is BaselineStatus.OK
+    assert result.spread == 0.0
+    assert result.z == 0.0
 
 
 def test_compute_baseline_status_cannot_be_mistaken_for_ok_via_type():
