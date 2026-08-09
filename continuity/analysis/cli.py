@@ -37,6 +37,20 @@ possible outcome for a thin slice), the pipeline falls back to the population-le
 and says so in the brief -- it must never silently report a WORSE answer than merging
 alone already gave.
 
+WHY SEVERITY IS THE MEDIAN, NOT THE PEAK: `impact.py`'s `qoe_delta_ratio` asks what
+subscribers TYPICALLY experienced across the whole incident, not the single worst
+5-minute bucket -- a lone unlucky bucket should not set the churn multiplier for a
+multi-hour incident, and the peak bucket is the planted multiplier PLUS whatever natural
+variance happened to land in that one window, which systematically overstates severity.
+`refine_incident` therefore independently re-labels the same bucket series `detect()`
+would (via its own public `label_buckets`, over the refined incident's own span) and
+takes the MEDIAN `(actual - expected) / expected` across every bucket that series marks
+ANOMALOUS -- median rather than mean, matching the robust-statistics choice made
+everywhere else in this project (baseline.py's median/MAD). The peak ratio is still
+computed and carried alongside it (`peak_deviation_ratio`) and both are printed in the
+brief, clearly labelled -- they answer different questions and showing only one invites
+the wrong conclusion.
+
 Every claim in the printed brief is backed by a query the gateway actually ran --
 `--show-sql` prints them. This is not a debugging aid; it is the anti-hallucination
 property the whole project rests on (`ClickHouseMCPGateway.query_log`).
@@ -58,12 +72,28 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 
 import typer
 from dotenv import load_dotenv
 
+from continuity.analysis.baseline import (
+    DEFAULT_LOOKBACK_WEEKS,
+    DEFAULT_TRAILING_DAYS,
+    ComparisonMode,
+)
 from continuity.analysis.correlate import CorrelationResult, correlate_changes
-from continuity.analysis.detect import BUCKET_WIDTH, AnomalyWindow, DetectionResult, detect
+from continuity.analysis.detect import (
+    BUCKET_WIDTH,
+    DEFAULT_MODE,
+    AnomalyWindow,
+    BucketStatus,
+    DetectionResult,
+    build_series_sql,
+    detect,
+    fetch_window_start,
+    label_buckets,
+)
 from continuity.analysis.impact import ImpactResult
 from continuity.analysis.impact import compute_impact as _compute_impact
 from continuity.analysis.metrics import METRICS, get_metric
@@ -228,6 +258,14 @@ class RefinedIncident:
     did not (`used_fallback=True`, `fallback_reason` explains why) -- re-detection must
     never silently produce a WORSE (narrower, less informative) answer than merging
     alone already gave.
+
+    `typical_deviation_ratio` is the MEDIAN `(actual - expected) / expected` magnitude
+    across every bucket independent re-labelling of the same series marks ANOMALOUS
+    within `span` -- what subscribers typically experienced, not the worst 5 minutes of
+    it. `peak_deviation_ratio` is the single worst bucket's own ratio, kept alongside it
+    for transparency (see the module docstring's "WHY SEVERITY IS THE MEDIAN, NOT THE
+    PEAK"). Impact is quantified from `typical_deviation_ratio`; both are shown in the
+    brief.
     """
 
     population_incident: MergedIncident
@@ -235,6 +273,9 @@ class RefinedIncident:
     windows: tuple[AnomalyWindow, ...]
     used_fallback: bool
     fallback_reason: str | None
+    typical_deviation_ratio: Decimal
+    peak_deviation_ratio: Decimal
+    severity_sql: str
 
     @property
     def final_slice(self) -> Slice:
@@ -330,6 +371,61 @@ def merge_windows_into_incidents(
     ]
 
 
+def _parse_bucket_datetime(value: str) -> datetime:
+    """Matches detect.py's own bucket timestamp format exactly (it is not exported --
+    trivial, one-line, and independently duplicated the same way correlate.py and
+    impact.py each already parse their own "%Y-%m-%d %H:%M:%S" timestamps)."""
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
+async def _typical_and_peak_deviation(
+    gateway: ClickHouseMCPGateway,
+    *,
+    slice_: Slice,
+    metric_name: str,
+    windows: Sequence[AnomalyWindow],
+) -> tuple[Decimal, Decimal, str]:
+    """The MEDIAN and the PEAK `(actual - expected) / expected` magnitude across every
+    bucket an independent re-labelling of `windows`' own span marks ANOMALOUS -- see
+    the module docstring's "WHY SEVERITY IS THE MEDIAN, NOT THE PEAK".
+
+    Composes detect.py's own public building blocks exactly as `detect()` itself would
+    (`fetch_window_start`, `build_series_sql`, `label_buckets`, with every default
+    unchanged) rather than trusting each `AnomalyWindow`'s own single recorded peak
+    bucket, which is the ONLY per-bucket figure `DetectionResult` exposes -- getting the
+    typical bucket instead requires re-examining the full series. One extra query.
+
+    Never empty-handed: if the re-labelling finds no ANOMALOUS bucket at all (a
+    parameter-mismatch edge case, not expected in practice since every default here
+    matches `detect()`'s own), the median falls back to the peak ratio rather than
+    raising or fabricating a zero.
+    """
+    span_start, span_end = windows[0].start, windows[-1].end
+    metric = get_metric(metric_name)
+    days_of_history = (
+        DEFAULT_TRAILING_DAYS if DEFAULT_MODE is ComparisonMode.TRAILING_DAYS
+        else DEFAULT_LOOKBACK_WEEKS * 7
+    )
+    fetch_start = fetch_window_start(span_start, days_of_history)
+    sql = build_series_sql(slice_, metric, fetch_start, span_end)
+    result = await gateway.query(sql)
+    observations = [(_parse_bucket_datetime(row["bucket"]), row["value"]) for row in result.rows]
+    labels = label_buckets(observations, start=span_start, end=span_end, metric=metric)
+
+    ratios: list[Decimal] = []
+    for label in labels:
+        if label.status is not BucketStatus.ANOMALOUS or label.value is None:
+            continue
+        expected = label.baseline.expected
+        if expected is None or expected == 0:
+            continue
+        ratios.append(Decimal(str(abs(label.value - expected) / abs(expected))))
+
+    peak_ratio = _qoe_delta_ratio(max(windows, key=lambda w: abs(w.peak_z)))
+    typical_ratio = median(ratios) if ratios else peak_ratio
+    return typical_ratio, peak_ratio, sql
+
+
 async def refine_incident(
     gateway: ClickHouseMCPGateway,
     incident: MergedIncident,
@@ -345,7 +441,8 @@ async def refine_incident(
     Falls back to the population-level span when the blast-radius re-detection finds
     no window at all (e.g. a thin slice with too little data for a robust baseline) --
     `used_fallback=True` and `fallback_reason` make that explicit rather than letting a
-    caller mistake a fallback for a successful refinement.
+    caller mistake a fallback for a successful refinement. Either way, the typical and
+    peak deviation ratios are measured over whichever span was actually used.
     """
     search_start, search_end = incident.span
     search_start -= refine_padding
@@ -354,23 +451,30 @@ async def refine_incident(
         gateway, incident.final_slice, metric_name, search_start, search_end
     )
     if refine_detection.windows:
-        return RefinedIncident(
-            population_incident=incident,
-            refine_detection=refine_detection,
-            windows=tuple(refine_detection.windows),
-            used_fallback=False,
-            fallback_reason=None,
-        )
-    return RefinedIncident(
-        population_incident=incident,
-        refine_detection=refine_detection,
-        windows=incident.windows,
-        used_fallback=True,
-        fallback_reason=(
+        windows = tuple(refine_detection.windows)
+        used_fallback = False
+        fallback_reason = None
+    else:
+        windows = incident.windows
+        used_fallback = True
+        fallback_reason = (
             f"re-detecting on the isolated blast radius over {_fmt_dt(search_start)} to "
             f"{_fmt_dt(search_end)} found no anomaly window (thin slice, or genuinely no "
             "signal at that grain) -- using the population-level span instead"
-        ),
+        )
+
+    typical_ratio, peak_ratio, severity_sql = await _typical_and_peak_deviation(
+        gateway, slice_=incident.final_slice, metric_name=metric_name, windows=windows
+    )
+    return RefinedIncident(
+        population_incident=incident,
+        refine_detection=refine_detection,
+        windows=windows,
+        used_fallback=used_fallback,
+        fallback_reason=fallback_reason,
+        typical_deviation_ratio=typical_ratio,
+        peak_deviation_ratio=peak_ratio,
+        severity_sql=severity_sql,
     )
 
 
@@ -461,7 +565,7 @@ async def investigate_pipeline(
         correlate_elapsed_ms += (time.perf_counter() - stage_started) * 1000
         correlate_queries.extend(gateway.query_log[idx:])
 
-        qoe_delta_ratio = _qoe_delta_ratio(refined.peak_window)
+        qoe_delta_ratio = refined.typical_deviation_ratio
         idx = len(gateway.query_log)
         stage_started = time.perf_counter()
         impact = await _compute_impact(
@@ -721,9 +825,19 @@ def _render_what_happened(ir: IncidentInvestigation, metric_label: str) -> list[
             f"{pop_peak.peak_z:.1f} at population level)."
         )
     peak = refined.peak_window
+    typical_multiple = float(refined.typical_deviation_ratio) + 1.0
+    peak_multiple = float(refined.peak_deviation_ratio) + 1.0
     lines.append(
-        f"  {metric_label} reached {peak.peak_value:.6g} at its worst (expected "
-        f"{peak.expected_at_peak:.6g})."
+        f"  {metric_label} reached {peak.peak_value:.6g} at its single worst bucket "
+        f"(expected {peak.expected_at_peak:.6g})."
+    )
+    lines.append(
+        f"  Typical degradation across the span: {typical_multiple:.1f}x baseline (median "
+        "across every anomalous bucket, not the worst one); worst single bucket: "
+        f"{peak_multiple:.1f}x baseline. Impact below is quantified from the TYPICAL figure --"
+    )
+    lines.append(
+        "  a single unlucky bucket must not set the churn multiplier for the whole incident."
     )
     lines.append("")
     return lines
@@ -813,8 +927,12 @@ def _render_revenue_impact(ir: IncidentInvestigation, show_sql: bool) -> list[st
         "population-level span",
         "    and not a single 5-minute fragment.",
         f"    base_monthly_churn={m.base_monthly_churn} +/-{m.base_churn_variation:.0%} "
-        f"(assumption, not measured); qoe_delta_ratio={m.qoe_delta_ratio:.3f} (from the "
-        "incident's worst burst).",
+        "(assumption, not measured);",
+        f"    qoe_delta_ratio={m.qoe_delta_ratio:.3f} -- the TYPICAL (median) deviation across "
+        f"the span, deliberately NOT the",
+        f"    peak (worst single bucket ratio {ir.incident.peak_deviation_ratio:.3f}) -- a lone "
+        "unlucky bucket must not set",
+        "    the churn multiplier for the whole incident.",
         "    Every coefficient is a documented assumption -- see continuity/analysis/impact.py.",
         "",
     ]

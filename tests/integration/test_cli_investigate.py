@@ -103,8 +103,19 @@ def _run_cli(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[
 # exactly, which is what makes the tolerance below tight rather than the generous one
 # merging alone could support.
 _TRUE_ROKU_820_SUBSCRIBERS = 3689
+_TRUE_ROKU_820_ARR = 36094
 _MIN_ACCEPTABLE_FRACTION = 0.85
 _MAX_ACCEPTABLE_FRACTION = 1.2
+
+# Ground truth plants a 4.5x rebuffer multiplier for this incident (see
+# data/ground_truth.json's "effects": [{"metric": "rebuffer", "multiplier": 4.5}]) --
+# i.e. the typical deviation ratio (actual - expected) / expected should land near
+# 4.5 - 1 = 3.5. This is a genuinely checkable claim, not a tuned one: the median is
+# computed by continuity/analysis/cli.py::_typical_and_peak_deviation from the raw
+# bucket series, with no knowledge of this planted value.
+_PLANTED_ROKU_820_MULTIPLIER = 4.5
+_MIN_TYPICAL_MULTIPLIER = 3.5
+_MAX_TYPICAL_MULTIPLIER = 5.5
 
 _DT_PAIR = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 
@@ -173,12 +184,40 @@ def test_investigate_by_incident_id_refines_to_the_true_span_and_impact():
         "by more than expected"
     )
 
-    dollar_figures = [
-        float(m.group(1).replace(",", ""))
-        for m in re.finditer(r"ARR at risk: \$([\d,]+\.\d{2})", output)
-    ]
-    assert dollar_figures, "expected a dollar figure in the brief"
-    assert dollar_figures[0] > 1000, f"expected a substantial ARR figure, got {dollar_figures}"
+    expected_arr_match = re.search(r"expected \$([\d,]+\.\d{2})\)", output)
+    assert expected_arr_match, f"expected an 'expected $X' ARR figure in:\n{output}"
+    expected_arr = float(expected_arr_match.group(1).replace(",", ""))
+    assert expected_arr > 1000, f"expected a substantial ARR figure, got {expected_arr}"
+    assert expected_arr >= _TRUE_ROKU_820_ARR * _MIN_ACCEPTABLE_FRACTION, (
+        f"expected ARR {expected_arr} is too far below the true ~{_TRUE_ROKU_820_ARR}"
+    )
+    assert expected_arr <= _TRUE_ROKU_820_ARR * _MAX_ACCEPTABLE_FRACTION, (
+        f"expected ARR {expected_arr} overshoots the true ~{_TRUE_ROKU_820_ARR} by more "
+        "than expected"
+    )
+
+    # Severity fed into impact must be the TYPICAL (median) deviation across the span, not
+    # the single worst bucket -- both are shown, clearly labelled, so a reader cannot
+    # mistake one for the other.
+    typical_match = re.search(r"Typical degradation across the span: ([\d.]+)x baseline", output)
+    peak_match = re.search(r"worst single bucket: ([\d.]+)x baseline", output)
+    assert typical_match, f"expected a 'Typical degradation' line in:\n{output}"
+    assert peak_match, f"expected a 'worst single bucket' line in:\n{output}"
+    typical_multiplier = float(typical_match.group(1))
+    peak_multiplier = float(peak_match.group(1))
+    assert peak_multiplier > typical_multiplier, (
+        "the worst single bucket should read worse than the typical (median) deviation, got "
+        f"typical={typical_multiplier} peak={peak_multiplier}"
+    )
+
+    # The checkable claim: ground truth plants a 4.5x rebuffer multiplier for this incident
+    # (see the module comment above), so the independently-measured typical multiplier
+    # should land close to it -- this was never told the planted value.
+    assert _MIN_TYPICAL_MULTIPLIER <= typical_multiplier <= _MAX_TYPICAL_MULTIPLIER, (
+        f"typical degradation multiplier {typical_multiplier}x is far from the planted "
+        f"{_PLANTED_ROKU_820_MULTIPLIER}x -- expected the median across anomalous buckets "
+        "to recover something close to the planted severity"
+    )
 
     # Correlating against the TRUE (refined) onset must score at least as well as
     # correlating against the first population-level peak did before refinement (0.22).
@@ -225,6 +264,26 @@ def _fake_walk_result(final_slice: Slice, window: tuple[datetime, datetime]):
     )
 
 
+class _FakeQueryResult:
+    """The minimal shape `_typical_and_peak_deviation` reads: no observations at all,
+    so its own re-labelling degrades gracefully to the peak-ratio fallback rather than
+    crashing on an empty series -- exercising that fallback-within-a-fallback path too."""
+
+    rows: list[dict] = []
+
+
+class _FakeGateway:
+    """A gateway double for the severity re-labelling query `refine_incident` also
+    issues -- `detect()` itself is monkeypatched separately, but `_typical_and_peak_deviation`
+    calls `gateway.query()` directly and must have something to call."""
+
+    def __init__(self) -> None:
+        self.query_log: list = []
+
+    async def query(self, sql: str) -> _FakeQueryResult:
+        return _FakeQueryResult()
+
+
 def test_refine_incident_falls_back_to_the_population_span_when_it_finds_nothing(monkeypatch):
     """`refine_incident` re-detects on the isolated blast radius -- a pure orchestration
     step this test exercises directly (no DB needed: `detect` is monkeypatched) rather
@@ -252,7 +311,7 @@ def test_refine_incident_falls_back_to_the_population_span_when_it_finds_nothing
     monkeypatch.setattr(cli_module, "detect", fake_detect)
     refined = asyncio.run(
         cli_module.refine_incident(
-            object(),  # never touched: detect() is mocked
+            _FakeGateway(),
             incident,
             metric_name="rebuffer",
             refine_padding=timedelta(hours=6),
@@ -264,6 +323,9 @@ def test_refine_incident_falls_back_to_the_population_span_when_it_finds_nothing
     assert "population-level span" in refined.fallback_reason
     assert refined.span == incident.span
     assert refined.windows == incident.windows
+    # Severity is still measured (over the fallback span), never left undefined.
+    assert refined.typical_deviation_ratio > 0
+    assert refined.peak_deviation_ratio > 0
 
 
 # --- --show-sql is the anti-hallucination property, not decoration -------------------
