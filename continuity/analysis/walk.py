@@ -46,19 +46,35 @@ from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, ExecutedQuery
 # per-title fault should pass it explicitly via `dimensions`.
 DEFAULT_DIMENSIONS: tuple[str, ...] = DIMENSION_HIERARCHY
 
-# A value must explain at least this share of the slice's deviation to be worth
-# descending into. Measured live against the real dataset (see
-# tests/integration/test_walk_real.py): the true fault dimensions score 93-107%
-# (device_type=roku 107%, app_version=8.2.0 99%, cdn=cdn_northwind 94%, pop=nw-atl-2
-# 96%), while the first split AFTER the true fault is already isolated -- which only
-# reflects where that (now uniformly affected) traffic happens to live, e.g.
-# country=US, not an additional cause -- drops to 42-59%. That drop is not
-# coincidental: once a dimension's degradation is uniform across its values, each
-# value's contribution reduces to weight_share * (the same delta for everyone), so its
-# share_of_deviation converges to its plain weight_share -- "explains a lot because
-# it's a big population," not "because it's the cause." 0.6 sits cleanly between the
-# two measured clusters on this dataset.
-DEFAULT_MIN_SHARE = 0.6
+# The PRIMARY stopping criterion. `lift = share_of_deviation / weight_share` (see
+# split.py's module docstring): a value whose share of the deviation merely matches
+# its share of the population has lift == 1 and explains nothing beyond being big --
+# splitting a UNIFORMLY degraded slice on any dimension reproduces exactly this, since
+# every value then carries the same signed delta and share_of_deviation collapses to
+# weight_share by construction. A raw share threshold cannot tell that case apart from
+# a genuine localized fault (both can show a high absolute share, if the affected
+# population also happens to be a large one) -- lift can, because it divides the
+# population-size effect out.
+#
+# 1.5 is chosen by REASONING about the ratio itself, not by sweeping this dataset for
+# a number that happens to separate it (that is precisely the failure mode this
+# threshold replaces): it requires the deviation to be at least 50% more concentrated
+# in the candidate value than its population size alone would produce. That margin is
+# wide enough to absorb ordinary sampling noise and a partially-diluted true signal
+# (e.g. a fault that affects most, but not all, of a value's traffic, or a value that
+# is a strict superset of the true affected population) without crossing 1.5 by
+# accident, while a genuine localized fault -- where the deviation concentrates in a
+# minority of the traffic -- clears it by several multiples, not by a hair. See
+# tests/analysis/test_walk.py::test_choose_next_step_stops_on_uniform_degradation_not_
+# the_biggest_segment for the degenerate case (lift == 1 exactly) this threshold
+# exists to reject.
+DEFAULT_MIN_LIFT = 1.5
+
+# An OPTIONAL secondary guard, off by default (`None`): if a caller supplies it, the
+# best candidate's raw share_of_deviation must also clear this bar. It must never be
+# the primary criterion -- see the coordinator's own rejection of a tuned absolute
+# threshold, which is exactly what a load-bearing default here would reintroduce.
+DEFAULT_MIN_SHARE: float | None = None
 
 # Cannot usefully exceed the number of candidate dimensions -- once every dimension is
 # fixed there is nothing left to split on (DIMENSIONS_EXHAUSTED fires first anyway).
@@ -77,9 +93,16 @@ class StopReason(Enum):
     """Why the walk stopped where it did. Recorded on every `WalkResult` -- "why did it
     stop here" is a product feature, not an implementation detail to be inferred."""
 
+    LOW_LIFT = "low_lift"
+    """The best-explaining value's LIFT (share_of_deviation / weight_share) fell below
+    `min_lift`: it explains no more of the deviation than its population size alone
+    would predict -- the "biggest population segment" trap, not a real signal."""
+
     LOW_SHARE = "low_share"
-    """The best-explaining value's share of the slice's deviation fell below
-    `min_share`: no single value explains enough to justify descending."""
+    """The optional secondary `min_share` guard fired: the best-explaining value's raw
+    share of the slice's deviation fell below it. Only reachable when a caller
+    supplies `min_share`, or when no candidate has a positive share at all (nothing to
+    rank by lift in the first place)."""
 
     SINGLE_VALUE = "single_value"
     """Every remaining dimension had at most one usable value present -- no dimension
@@ -99,11 +122,13 @@ class StopReason(Enum):
 @dataclass(frozen=True)
 class RefinementStep:
     """One step of the drill-down: which dimension, which value, how much of the
-    slice's deviation it explained, and the SQL behind that number."""
+    slice's deviation it explained, its LIFT over its own population share, and the
+    SQL behind that number."""
 
     dimension: str
     value: str
     share_of_deviation: float
+    lift: float
     contribution: float
     weight: float
     sql: str
@@ -120,6 +145,7 @@ class WalkResult:
     path: tuple[RefinementStep, ...]
     final_slice: Slice
     stop_reason: StopReason
+    stop_detail: str
     elapsed_ms: float
     query_log: tuple[ExecutedQuery, ...]
 
@@ -154,13 +180,15 @@ def _population_weight(splits: dict[str, SplitResult]) -> float | None:
 def choose_next_step(
     splits: dict[str, SplitResult],
     *,
-    min_share: float,
+    min_lift: float,
     min_weight_fraction: float,
     root_weight: float | None,
-) -> tuple[RefinementStep | None, StopReason | None]:
+    min_share: float | None = None,
+) -> tuple[RefinementStep | None, StopReason | None, str | None]:
     """The pure decision at one level of the walk: which dimension/value to descend
-    into next, or why to stop here instead. Exactly one of the two return values is
-    non-`None`.
+    into next, or why to stop here instead. Exactly one of (`step`) or
+    (`stop_reason`, `stop_detail`) is populated; `stop_detail` always carries the
+    measured number that triggered the stop, not just its label.
 
     Only dimensions `split_dimensions_median_baseline` marked `informative` are
     considered (requirement: a dimension with a single usable value gains no
@@ -171,6 +199,13 @@ def choose_next_step(
     from the slice's overall deviation) cannot explain the slice's problem and are not
     candidates. The dimension whose candidate has the LARGEST share wins: "the
     dimension whose best value explains the most of the current slice's deviation."
+
+    The PRIMARY gate on that winner is its LIFT (`share_of_deviation / weight_share`),
+    not its raw share -- see `DEFAULT_MIN_LIFT`'s module-level comment for why a raw
+    share threshold cannot distinguish a genuine localized fault from a big value that
+    merely inherited its share from its own population size. `min_share`, if supplied,
+    is an OPTIONAL secondary guard checked only after the lift gate has already
+    passed -- it is never the reason a step is accepted.
     """
     informative = {
         dimension: result
@@ -178,7 +213,11 @@ def choose_next_step(
         if result.informative and result.values
     }
     if not informative:
-        return None, StopReason.SINGLE_VALUE
+        return (
+            None,
+            StopReason.SINGLE_VALUE,
+            "no remaining dimension had more than one usable value",
+        )
 
     candidates = [
         (dimension, result.values[0])
@@ -187,30 +226,57 @@ def choose_next_step(
         and result.values[0].share_of_deviation > 0
     ]
     if not candidates:
-        return None, StopReason.LOW_SHARE
+        return (
+            None,
+            StopReason.LOW_SHARE,
+            "every remaining dimension's top value had an undefined or non-positive "
+            "share of the slice's deviation",
+        )
 
     best_dimension, best = max(candidates, key=lambda item: item[1].share_of_deviation)
 
-    if best.share_of_deviation < min_share:
-        return None, StopReason.LOW_SHARE
+    if best.lift is None or best.lift < min_lift:
+        measured = "undefined" if best.lift is None else f"{best.lift:.2f}"
+        return (
+            None,
+            StopReason.LOW_LIFT,
+            f"{best_dimension}={best.value!r} has lift {measured} "
+            f"(share_of_deviation={best.share_of_deviation:.3f}, "
+            f"weight_share={(best.weight_share or 0.0):.3f}) < min_lift {min_lift:.2f} "
+            "-- explains no more of the deviation than its population size alone would predict",
+        )
+
+    if min_share is not None and best.share_of_deviation < min_share:
+        return (
+            None,
+            StopReason.LOW_SHARE,
+            f"{best_dimension}={best.value!r} share_of_deviation "
+            f"{best.share_of_deviation:.3f} < min_share {min_share:.2f}",
+        )
 
     if (
         root_weight is not None
         and root_weight > 0
         and best.weight < root_weight * min_weight_fraction
     ):
-        return None, StopReason.TOO_SMALL
+        return (
+            None,
+            StopReason.TOO_SMALL,
+            f"{best_dimension}={best.value!r} weight {best.weight:.1f} < "
+            f"min_weight_fraction {min_weight_fraction:.4f} of root weight {root_weight:.1f}",
+        )
 
     step = RefinementStep(
         dimension=best_dimension,
         value=best.value,
         share_of_deviation=best.share_of_deviation,
+        lift=best.lift,
         contribution=best.contribution if best.contribution is not None else 0.0,
         weight=best.weight,
         sql=best.sql,
         baseline_sql=best.baseline_sql,
     )
-    return step, None
+    return step, None, None
 
 
 async def walk(
@@ -220,9 +286,10 @@ async def walk(
     window: tuple[datetime, datetime],
     dimensions: Sequence[str] = DEFAULT_DIMENSIONS,
     lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
-    min_share: float = DEFAULT_MIN_SHARE,
+    min_lift: float = DEFAULT_MIN_LIFT,
     max_depth: int = DEFAULT_MAX_DEPTH,
     min_weight_fraction: float = DEFAULT_MIN_WEIGHT_FRACTION,
+    min_share: float | None = DEFAULT_MIN_SHARE,
 ) -> WalkResult:
     """Drill down from the whole population into `window`, one dimension at a time.
 
@@ -251,15 +318,18 @@ async def walk(
     path: list[RefinementStep] = []
     root_weight: float | None = None
     stop_reason = StopReason.MAX_DEPTH
+    stop_detail = f"reached max_depth={max_depth} before any dimension could be split"
 
     while True:
         if len(path) >= max_depth:
             stop_reason = StopReason.MAX_DEPTH
+            stop_detail = f"reached max_depth={max_depth}"
             break
 
         remaining = [d for d in dimensions if d not in current_slice.dimensions]
         if not remaining:
             stop_reason = StopReason.DIMENSIONS_EXHAUSTED
+            stop_detail = f"every candidate dimension {tuple(dimensions)} is already fixed"
             break
 
         splits = await split_dimensions_median_baseline(
@@ -274,15 +344,17 @@ async def walk(
         if root_weight is None:
             root_weight = _population_weight(splits)
 
-        step, reason = choose_next_step(
+        step, reason, detail = choose_next_step(
             splits,
+            min_lift=min_lift,
             min_share=min_share,
             min_weight_fraction=min_weight_fraction,
             root_weight=root_weight,
         )
         if step is None:
-            assert reason is not None
+            assert reason is not None and detail is not None
             stop_reason = reason
+            stop_detail = detail
             break
 
         path.append(step)
@@ -297,6 +369,7 @@ async def walk(
         path=tuple(path),
         final_slice=current_slice,
         stop_reason=stop_reason,
+        stop_detail=stop_detail,
         elapsed_ms=elapsed_ms,
         query_log=query_log,
     )

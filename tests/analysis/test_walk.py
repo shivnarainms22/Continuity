@@ -115,11 +115,16 @@ def test_population_weight_is_none_when_every_split_is_empty():
 
 # ---------------------------------------------------------------------------
 # choose_next_step: the pure per-level decision, and every stopping rule.
+#
+# Selection among dimensions is still by raw share (each dimension's top contributor)
+# -- LIFT is the gate on whether that winner is worth descending into, not the
+# selection criterion. See walk.py's DEFAULT_MIN_LIFT comment for the reasoning behind
+# the 1.5 default used throughout this section.
 # ---------------------------------------------------------------------------
 
 
 def test_choose_next_step_picks_the_dimension_with_the_highest_share():
-    # device_type: one dominant deviator -> share 1.0.
+    # device_type: one dominant deviator -> share 1.0, weight_share 0.25 -> lift 4.0.
     device = _split(
         "device_type",
         [
@@ -145,15 +150,17 @@ def test_choose_next_step_picks_the_dimension_with_the_highest_share():
     )
     splits = {"device_type": device, "app_version": app}
 
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.0, root_weight=None
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
     )
 
     assert reason is None
+    assert detail is None
     assert isinstance(step, RefinementStep)
     assert step.dimension == "device_type"
     assert step.value == "roku"
     assert step.share_of_deviation == pytest.approx(1.0)
+    assert step.lift == pytest.approx(4.0)
 
 
 def test_choose_next_step_returns_single_value_when_no_dimension_is_informative():
@@ -163,22 +170,27 @@ def test_choose_next_step_returns_single_value_when_no_dimension_is_informative(
             [ValueMeasurement(value="roku", metric_value=0.02, baseline_value=0.001, weight=100.0)],
         )
     }
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.0, root_weight=None
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
     )
     assert step is None
     assert reason is StopReason.SINGLE_VALUE
+    assert detail is not None
 
 
 def test_choose_next_step_returns_single_value_for_an_empty_splits_dict():
-    step, reason = choose_next_step({}, min_share=0.05, min_weight_fraction=0.0, root_weight=None)
+    step, reason, detail = choose_next_step(
+        {}, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
+    )
     assert step is None
     assert reason is StopReason.SINGLE_VALUE
+    assert detail is not None
 
 
 def test_choose_next_step_returns_low_share_when_net_deviation_is_zero():
     """Both values move, but they cancel -- rank_contributions leaves share_of_deviation
-    undefined (None) for exactly this reason (see test_split.py's own zero-net test)."""
+    undefined (None) for exactly this reason (see test_split.py's own zero-net test).
+    There is nothing to compute a lift FROM, so this is still LOW_SHARE, not LOW_LIFT."""
     splits = {
         "device_type": _split(
             "device_type",
@@ -188,14 +200,48 @@ def test_choose_next_step_returns_low_share_when_net_deviation_is_zero():
             ],
         )
     }
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.0, root_weight=None
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
     )
     assert step is None
     assert reason is StopReason.LOW_SHARE
+    assert detail is not None
 
 
-def test_choose_next_step_returns_low_share_when_best_share_is_below_threshold():
+def test_choose_next_step_stops_on_uniform_degradation_not_the_biggest_segment():
+    """THE TRAP. Both values degrade by the exact same amount -- a uniformly bad
+    dimension, not a localized fault. share_of_deviation then collapses to plain
+    weight_share for every value (roku: share 0.7 == weight_share 0.7; ios: share 0.3
+    == weight_share 0.3), so a raw-share threshold would happily chase "roku" as if it
+    were the biggest, most-explaining segment -- it is merely the biggest segment.
+    lift == 1.0 for BOTH values catches this exactly: descending would explain no more
+    than population size alone predicts. Do not "fix" this by lowering min_lift below
+    1.0 -- that would defeat the entire point of this test.
+    """
+    uniform = _split(
+        "device_type",
+        [
+            ValueMeasurement(
+                value="roku", metric_value=0.002, baseline_value=0.001, weight=700_000.0
+            ),
+            ValueMeasurement(
+                value="ios", metric_value=0.002, baseline_value=0.001, weight=300_000.0
+            ),
+        ],
+    )
+    splits = {"device_type": uniform}
+
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
+    )
+
+    assert step is None
+    assert reason is StopReason.LOW_LIFT
+    assert "device_type='roku'" in detail
+    assert "1.00" in detail  # the measured lift, not just the label
+
+
+def test_choose_next_step_returns_low_lift_when_best_lift_is_below_threshold():
     splits = {
         "app_version": _split(
             "app_version",
@@ -209,13 +255,13 @@ def test_choose_next_step_returns_low_share_when_best_share_is_below_threshold()
             ],
         )
     }
-    # This dimension's top share is well under 1.0 (the deviation is split across two
-    # values) -- a high min_share must reject it even though it IS informative.
-    step, reason = choose_next_step(
-        splits, min_share=0.9, min_weight_fraction=0.0, root_weight=None
+    # share_8.2.0 ~= 0.2857, weight_share_8.2.0 = 0.5 -> lift ~= 0.571, well under 1.5.
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.0, root_weight=None
     )
     assert step is None
-    assert reason is StopReason.LOW_SHARE
+    assert reason is StopReason.LOW_LIFT
+    assert "lift" in detail
 
 
 def test_choose_next_step_returns_too_small_when_candidate_weight_is_a_sliver_of_root():
@@ -230,14 +276,17 @@ def test_choose_next_step_returns_too_small_when_candidate_weight_is_a_sliver_of
             ],
         )
     }
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.01, root_weight=300_050.0
+    # roku's weight_share is tiny (50 / 300_050), so its lift is enormous -- the lift
+    # gate passes easily, and the too-small guard is what actually fires.
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.01, root_weight=300_050.0
     )
     assert step is None
     assert reason is StopReason.TOO_SMALL
+    assert detail is not None
 
 
-def test_choose_next_step_accepts_when_weight_clears_the_fraction_threshold():
+def test_choose_next_step_accepts_when_lift_and_weight_both_clear_their_thresholds():
     splits = {
         "device_type": _split(
             "device_type",
@@ -251,12 +300,14 @@ def test_choose_next_step_accepts_when_weight_clears_the_fraction_threshold():
             ],
         )
     }
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.01, root_weight=400_000.0
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.01, root_weight=400_000.0
     )
     assert reason is None
+    assert detail is None
     assert step is not None
     assert step.value == "roku"
+    assert step.lift == pytest.approx(4.0)
 
 
 def test_choose_next_step_ignores_root_weight_guard_when_root_weight_is_none():
@@ -265,23 +316,75 @@ def test_choose_next_step_ignores_root_weight_guard_when_root_weight_is_none():
     splits = {
         "device_type": _split(
             "device_type",
-            [ValueMeasurement(value="roku", metric_value=0.02, baseline_value=0.001, weight=1.0)],
+            [
+                ValueMeasurement(value="roku", metric_value=0.02, baseline_value=0.001, weight=1.0),
+                ValueMeasurement(value="ios", metric_value=0.001, baseline_value=0.001, weight=1.0),
+            ],
         )
     }
-    # Single usable value -> SINGLE_VALUE regardless; use two values to exercise the
-    # weight guard path with root_weight=None.
-    splits["device_type"] = _split(
-        "device_type",
-        [
-            ValueMeasurement(value="roku", metric_value=0.02, baseline_value=0.001, weight=1.0),
-            ValueMeasurement(value="ios", metric_value=0.001, baseline_value=0.001, weight=1.0),
-        ],
-    )
-    step, reason = choose_next_step(
-        splits, min_share=0.05, min_weight_fraction=0.5, root_weight=None
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.5, min_weight_fraction=0.5, root_weight=None
     )
     assert reason is None
+    assert detail is None
     assert step is not None
+
+
+def _moderate_share_high_lift_split():
+    """Three values sharing the deviation (0.4 / 0.35 / 0.25) so the top-ranked
+    value's raw share is a moderate 0.4 -- not close to 1.0 -- while its weight_share
+    is small (0.1), giving it a high lift (4.0). Isolates "moderate share, high lift"
+    from the min_share guard tests below, independent of the lift gate."""
+    return _split(
+        "device_type",
+        [
+            # weight_share 0.1, delta 4.0    -> contribution 0.4 -> share 0.40, lift 4.0
+            ValueMeasurement(
+                value="roku", metric_value=4.001, baseline_value=0.001, weight=100_000.0
+            ),
+            # weight_share 0.5, delta 0.7    -> contribution 0.35 -> share 0.35, lift 0.7
+            ValueMeasurement(
+                value="firetv", metric_value=0.701, baseline_value=0.001, weight=500_000.0
+            ),
+            # weight_share 0.4, delta 0.625  -> contribution 0.25 -> share 0.25, lift 0.625
+            ValueMeasurement(
+                value="ios", metric_value=0.626, baseline_value=0.001, weight=400_000.0
+            ),
+        ],
+    )
+
+
+def test_choose_next_step_optional_min_share_guard_is_secondary_to_lift():
+    """min_share, when supplied, is checked only AFTER the lift gate has already
+    passed -- it must never be the reason a step with a low lift is accepted, and it
+    must not fire ahead of a lift failure either."""
+    splits = {"device_type": _moderate_share_high_lift_split()}
+
+    # roku's lift is 4.0 (clears min_lift=1.0 easily) but its raw share is only 0.4 --
+    # an explicit min_share above that rejects it even though lift alone would accept.
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.0, min_share=0.5, min_weight_fraction=0.0, root_weight=None
+    )
+    assert step is None
+    assert reason is StopReason.LOW_SHARE
+    assert "min_share" in detail
+
+
+def test_choose_next_step_min_share_defaults_to_off():
+    """Calling without min_share at all must not silently apply one -- its default
+    must not be load-bearing. Same fixture as the test above; the only difference is
+    that min_share is omitted here, and the step that guard rejected there is accepted."""
+    splits = {"device_type": _moderate_share_high_lift_split()}
+
+    step, reason, detail = choose_next_step(
+        splits, min_lift=1.0, min_weight_fraction=0.0, root_weight=None
+    )
+    assert reason is None
+    assert detail is None
+    assert step is not None
+    assert step.value == "roku"
+    assert step.share_of_deviation == pytest.approx(0.4)
+    assert step.lift == pytest.approx(4.0)
 
 
 # ---------------------------------------------------------------------------
@@ -468,18 +571,21 @@ def _roku_820_dataset(
             {"value": "8.0.9", "metric_value": 0.001, "weight": 95_000.0},
         ],
     }
+    # weight_share_8.2.0 = 30_000 / 100_000 = 0.3, so lift = share(1.0) / 0.3 ~= 3.33 --
+    # comfortably above DEFAULT_MIN_LIFT (1.5), unlike an 80% weight_share (lift 1.25)
+    # which would (correctly) stop the walk one level too early for this test's purpose.
     roku_window_rows = {
         "app_version": [
-            {"value": "8.2.0", "metric_value": 0.02, "weight": 80_000.0},
-            {"value": "8.1.4", "metric_value": 0.001, "weight": 15_000.0},
-            {"value": "8.0.9", "metric_value": 0.001, "weight": 5_000.0},
+            {"value": "8.2.0", "metric_value": 0.02, "weight": 30_000.0},
+            {"value": "8.1.4", "metric_value": 0.001, "weight": 60_000.0},
+            {"value": "8.0.9", "metric_value": 0.001, "weight": 10_000.0},
         ],
     }
     roku_baseline_rows = {
         "app_version": [
-            {"value": "8.2.0", "metric_value": 0.001, "weight": 78_000.0},
-            {"value": "8.1.4", "metric_value": 0.001, "weight": 15_000.0},
-            {"value": "8.0.9", "metric_value": 0.001, "weight": 5_000.0},
+            {"value": "8.2.0", "metric_value": 0.001, "weight": 29_000.0},
+            {"value": "8.1.4", "metric_value": 0.001, "weight": 58_000.0},
+            {"value": "8.0.9", "metric_value": 0.001, "weight": 9_500.0},
         ],
     }
 
@@ -508,7 +614,6 @@ async def test_walk_descends_device_type_then_app_version_and_exhausts_dimension
         window=window,
         dimensions=["device_type", "app_version"],
         lookback_weeks=lookback_weeks,
-        min_share=0.05,
         min_weight_fraction=0.0,
     )
 
@@ -522,6 +627,10 @@ async def test_walk_descends_device_type_then_app_version_and_exhausts_dimension
     assert result.metric == "rebuffer"
     assert result.baseline_windows == baseline_windows
     assert result.elapsed_ms >= 0.0
+
+    # Every step's lift is recorded and clears the default min_lift -- that is WHY the
+    # walk was willing to descend at all.
+    assert all(step.lift >= 1.5 for step in result.path)
 
     # Requirement 3: never re-split a dimension already fixed in the current slice.
     assert len({step.dimension for step in result.path}) == len(result.path)
@@ -542,7 +651,6 @@ async def test_walk_stops_at_max_depth_before_exhausting_dimensions():
         metric_name="rebuffer",
         window=window,
         dimensions=["device_type", "app_version"],
-        min_share=0.05,
         min_weight_fraction=0.0,
         max_depth=1,
     )

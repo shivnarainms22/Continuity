@@ -22,6 +22,17 @@ ratios and buries the real cause -- see
 ``test_naive_ranking_by_raw_deviation_would_wrongly_promote_the_tiny_slice`` in
 tests/analysis/test_split.py.
 
+``lift = share_of_deviation / weight_share`` is carried on every ``Contribution`` for
+the same reason ``share_of_deviation`` alone is not sufficient to decide whether a
+value is worth pursuing further (see ``continuity/analysis/walk.py``'s stopping rule):
+when a dimension's degradation is UNIFORM across its values, ``share_of_deviation``
+mathematically collapses to that value's plain ``weight_share`` (every value's signed
+delta is the same, so ``contribution_v = weight_share_v * delta`` and
+``total_contribution = delta``, giving ``share_v = weight_share_v`` exactly). A value
+that merely explains its own population share of the deviation -- lift ~= 1 -- is
+"big," not "the cause." Lift is undefined (``None``) whenever ``share_of_deviation``
+or ``weight_share`` is undefined, or ``weight_share`` is 0.
+
 Weighting is explicit per metric (requirement 2 of Task 5):
 
 * Ratio metrics (rebuffer, errors) are weighted by their own denominator -- watched_ms
@@ -100,6 +111,7 @@ class Contribution:
     weight_share: float | None
     contribution: float | None
     share_of_deviation: float | None
+    lift: float | None
     note: str | None
     sql: str
     baseline_sql: str
@@ -189,6 +201,11 @@ def rank_contributions(
                 final_note = "zero net deviation across values -- share of deviation is undefined"
             else:
                 share = contribution / total_contribution
+        lift = (
+            share / weight_share
+            if share is not None and weight_share is not None and weight_share > 0
+            else None
+        )
         results.append(
             Contribution(
                 dimension=dimension,
@@ -199,6 +216,7 @@ def rank_contributions(
                 weight_share=weight_share,
                 contribution=contribution,
                 share_of_deviation=share,
+                lift=lift,
                 note=final_note,
                 sql=sql,
                 baseline_sql=baseline_sql,
