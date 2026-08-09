@@ -87,8 +87,23 @@ def _run_cli(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[
 
 # --- a known incident produces a brief a VP could be handed --------------------------
 
+# Measured directly over INC-APP-ROKU-820's true 8-hour ground-truth window
+# (device_type=roku AND app_version=8.2.0, 2026-02-12 18:00 to 2026-02-13 02:00) against
+# this frozen, seeded dataset. detect() runs on the WHOLE population, where this slice is
+# only ~8% of sessions -- a diluted signal that breaches threshold at just a handful of
+# peaks, fragmenting into several raw anomaly windows separated by quiet stretches. Merging
+# those windows (continuity/analysis/cli.py::merge_windows_into_incidents) recovers most,
+# but not all, of the true window -- its span runs from the first surviving window's start
+# to the last one's end, which does not reach all the way back to the incident's true onset
+# or all the way to its true offset. The tolerance below is generous for that reason, but it
+# still catches a regression back to the old per-window behaviour, which reported ~356
+# subscribers for a single 25-minute fragment -- roughly a tenth of the true count.
+_TRUE_ROKU_820_SUBSCRIBERS = 3689
+_MIN_ACCEPTABLE_FRACTION = 0.5
+_MAX_ACCEPTABLE_FRACTION = 1.2
 
-def test_investigate_by_incident_id_names_the_blast_radius_and_a_dollar_figure():
+
+def test_investigate_by_incident_id_merges_windows_into_one_incident_near_true_impact():
     result = _run_cli("--incident", "INC-APP-ROKU-820")
 
     assert result.returncode == 0, result.stderr
@@ -98,21 +113,42 @@ def test_investigate_by_incident_id_names_the_blast_radius_and_a_dollar_figure()
     assert "roku" in lowered, output
     assert "8.2.0" in output, output
 
-    subscriber_counts = [
-        int(m.group(1).replace(",", ""))
-        for m in re.finditer(r"Affected subscribers:\s*([\d,]+)", output)
-    ]
-    assert subscriber_counts, "expected at least one 'Affected subscribers:' line"
-    assert any(count > 0 for count in subscriber_counts), (
-        f"expected a non-zero affected-subscriber count, got {subscriber_counts}"
-    )
-
-    assert re.search(r"\$[\d,]+\.\d{2}", output), "expected a dollar figure in the brief"
-
     # Every anomaly window found must genuinely isolate the planted fault's blast
     # radius -- not just mention "roku" and "8.2.0" somewhere incidental.
     assert "device_type = roku" in output
     assert "app_version = 8.2.0" in output
+
+    # The 4 raw detection windows for this incident (same blast radius, gaps well under
+    # the default 2h merge window) must merge into exactly ONE incident, not four separate
+    # briefs each describing a fragment.
+    section_count = output.count("SUBSCRIBERS AFFECTED AND ARR AT RISK")
+    assert section_count == 1, (
+        f"expected the raw anomaly windows to merge into ONE incident, got {section_count} "
+        f"separate incident sections:\n{output}"
+    )
+
+    subscriber_counts = [
+        int(m.group(1).replace(",", ""))
+        for m in re.finditer(r"Affected subscribers:\s*([\d,]+)", output)
+    ]
+    assert len(subscriber_counts) == 1
+    count = subscriber_counts[0]
+    assert count >= _TRUE_ROKU_820_SUBSCRIBERS * _MIN_ACCEPTABLE_FRACTION, (
+        f"merged subscriber count {count} is too far below the true "
+        f"~{_TRUE_ROKU_820_SUBSCRIBERS} measured over the incident's full window -- looks "
+        "like windows are not merging into one incident"
+    )
+    assert count <= _TRUE_ROKU_820_SUBSCRIBERS * _MAX_ACCEPTABLE_FRACTION, (
+        f"merged subscriber count {count} overshoots the true ~{_TRUE_ROKU_820_SUBSCRIBERS} "
+        "by more than expected"
+    )
+
+    dollar_figures = [
+        float(m.group(1).replace(",", ""))
+        for m in re.finditer(r"ARR at risk: \$([\d,]+\.\d{2})", output)
+    ]
+    assert dollar_figures, "expected a dollar figure in the brief"
+    assert dollar_figures[0] > 1000, f"expected a substantial ARR figure, got {dollar_figures}"
 
     # The recommended action is explicitly a proposal, never framed as already done.
     assert "PROPOSAL" in output
