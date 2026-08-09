@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Frontend -- rebuilt fresh inside the node stage; a stale local node_modules/dist
+# must never leak into the build context (this is the whole point of the multi-stage
+# build: the Node toolchain and its packages never reach the runtime image).
+web/node_modules/
+web/dist/
+
+# VCS / secrets / docs -- irrelevant to the runtime image
+.git/
+.github/
+.env
+docs/
+
+# Generated logs, never needed at runtime (data/ground_truth.json IS needed -- not excluded)
+data/*.log
+data/*.err
