@@ -5,8 +5,9 @@ sub-project 3's Gemini-driven investigator will produce:
 
     detect() on the whole population -> for each anomaly window, walk() to localise the
     blast radius -> MERGE windows that resolve to the same blast radius and are close in
-    time into one incident -> correlate_changes() and compute_impact() ONCE per merged
-    incident -> a plain-text incident brief.
+    time into one incident -> RE-DETECT on that blast radius (not the population) over a
+    padded search range to find the fault's TRUE onset/offset -> correlate_changes() and
+    compute_impact() ONCE per incident, over the true span -> a plain-text incident brief.
 
 This module contains no analysis logic of its own -- every number comes from detect.py,
 walk.py, correlate.py or impact.py. It only orchestrates the calls, times each stage, and
@@ -21,8 +22,20 @@ them. Reporting each window as its own incident (a) drastically understates the 
 subscriber/revenue impact -- correlating and quantifying over a 25-minute fragment
 instead of the true multi-hour incident -- and (b) is exactly the alert-fatigue behaviour
 this project exists to argue against. `merge_windows_into_incidents` groups windows that
-walk() resolved to the SAME blast radius and are within `merge_gap` of each other, and
-correlation/impact run once over the merged span, not once per raw window.
+walk() resolved to the SAME blast radius and are within `merge_gap` of each other.
+
+WHY RE-DETECTION MATTERS: merging alone still bounds the incident's span by wherever the
+diluted, population-level signal happened to cross threshold -- it recovers the gaps
+BETWEEN peaks, but not the shoulders before the first peak or after the last one, where
+the population-level signal never crossed threshold at all. `refine_incident` runs
+`detect()` a second time -- unchanged, just given the blast radius `Slice` instead of the
+whole population, per its already-public signature -- over the merged span padded by
+`refine_padding` hours on each side. Measured directly against the isolated slice rather
+than diluted across the whole population, the same fault reads as a much larger z-score
+and its true onset/offset become visible. If that second detect() finds nothing (a
+possible outcome for a thin slice), the pipeline falls back to the population-level span
+and says so in the brief -- it must never silently report a WORSE answer than merging
+alone already gave.
 
 Every claim in the printed brief is backed by a query the gateway actually ran --
 `--show-sql` prints them. This is not a debugging aid; it is the anti-hallucination
@@ -76,6 +89,13 @@ INCIDENT_SEARCH_PADDING = timedelta(hours=6)
 # leaves between the peaks of one continuous, narrowly-scoped fault (see the module
 # docstring) without bridging across genuinely separate incidents days apart.
 DEFAULT_MERGE_GAP = timedelta(hours=2)
+
+# How far past the merged, population-level span to search when re-detecting on the
+# isolated blast radius (see the module docstring's "WHY RE-DETECTION MATTERS"). Bounded
+# and configurable rather than scanning the whole dataset -- 6 hours on each side is
+# generous for a fault whose population-level span is itself only a few hours wide,
+# without turning every investigation into a multi-day scan.
+DEFAULT_REFINE_PADDING = timedelta(hours=6)
 
 _SEPARATOR = "=" * 78
 _RULE = "-" * 78
@@ -152,13 +172,16 @@ class MergedIncident:
     """Several anomaly windows that walk() resolved to the SAME blast radius, within
     `merge_gap` of each other, merged into one incident.
 
-    `windows` is kept in full (not collapsed away) so the brief can show exactly which
-    5-minute buckets breached threshold -- never claiming the whole span was anomalous
-    when only a fraction of it measurably was. `representative_walk` is the walk() run
-    over the constituent window with the single worst (largest |peak_z|) deviation --
-    used for the displayed drill-down path since it is the clearest signal, though by
-    construction of the merge condition every constituent window resolved to the same
-    final slice.
+    This is the POPULATION-LEVEL view: its `span` is bounded by wherever the diluted,
+    whole-population signal happened to cross threshold, not the fault's true
+    onset/offset -- see `RefinedIncident` for the blast-radius-level re-detection that
+    corrects for that. `windows` is kept in full (not collapsed away) so the brief can
+    show exactly which 5-minute buckets breached threshold -- never claiming the whole
+    span was anomalous when only a fraction of it measurably was. `representative_walk`
+    is the walk() run over the constituent window with the single worst (largest
+    |peak_z|) deviation -- used for the displayed drill-down path since it is the
+    clearest signal, though by construction of the merge condition every constituent
+    window resolved to the same final slice.
     """
 
     windows: tuple[AnomalyWindow, ...]
@@ -195,10 +218,51 @@ class MergedIncident:
 
 
 @dataclass(frozen=True)
-class IncidentInvestigation:
-    """One merged incident's cause and business impact."""
+class RefinedIncident:
+    """A `MergedIncident` re-examined by running `detect()` again on its own isolated
+    blast radius (rather than the whole population), over a padded search range.
 
-    incident: MergedIncident
+    `windows` holds whichever set of `AnomalyWindow`s the incident's span/peak are
+    actually derived from: the blast-radius re-detection's own windows when it found
+    anything (`used_fallback=False`), or the original population-level windows when it
+    did not (`used_fallback=True`, `fallback_reason` explains why) -- re-detection must
+    never silently produce a WORSE (narrower, less informative) answer than merging
+    alone already gave.
+    """
+
+    population_incident: MergedIncident
+    refine_detection: DetectionResult
+    windows: tuple[AnomalyWindow, ...]
+    used_fallback: bool
+    fallback_reason: str | None
+
+    @property
+    def final_slice(self) -> Slice:
+        return self.population_incident.final_slice
+
+    @property
+    def span(self) -> tuple[datetime, datetime]:
+        return self.windows[0].start, self.windows[-1].end
+
+    @property
+    def peak_window(self) -> AnomalyWindow:
+        return max(self.windows, key=lambda w: abs(w.peak_z))
+
+    @property
+    def anomalous_bucket_count(self) -> int:
+        return sum(w.bucket_count for w in self.windows)
+
+    @property
+    def span_bucket_count(self) -> int:
+        start, end = self.span
+        return max(1, int((end - start) / BUCKET_WIDTH))
+
+
+@dataclass(frozen=True)
+class IncidentInvestigation:
+    """One (refined) incident's cause and business impact."""
+
+    incident: RefinedIncident
     correlation: CorrelationResult
     impact: ImpactResult
     qoe_delta_ratio: Decimal
@@ -261,11 +325,53 @@ def merge_windows_into_incidents(
         else:
             groups.append([(anomaly, walk_result)])
     return [
-        MergedIncident(
-            windows=tuple(a for a, _ in group), walks=tuple(w for _, w in group)
-        )
+        MergedIncident(windows=tuple(a for a, _ in group), walks=tuple(w for _, w in group))
         for group in groups
     ]
+
+
+async def refine_incident(
+    gateway: ClickHouseMCPGateway,
+    incident: MergedIncident,
+    *,
+    metric_name: str,
+    refine_padding: timedelta = DEFAULT_REFINE_PADDING,
+) -> RefinedIncident:
+    """Re-detect on `incident`'s own blast radius, not the whole population, over the
+    merged span padded by `refine_padding` on each side -- see the module docstring's
+    "WHY RE-DETECTION MATTERS". `detect()` itself is unchanged; this only calls it with
+    a narrower `Slice` and a different window than the population-level scan used.
+
+    Falls back to the population-level span when the blast-radius re-detection finds
+    no window at all (e.g. a thin slice with too little data for a robust baseline) --
+    `used_fallback=True` and `fallback_reason` make that explicit rather than letting a
+    caller mistake a fallback for a successful refinement.
+    """
+    search_start, search_end = incident.span
+    search_start -= refine_padding
+    search_end += refine_padding
+    refine_detection = await detect(
+        gateway, incident.final_slice, metric_name, search_start, search_end
+    )
+    if refine_detection.windows:
+        return RefinedIncident(
+            population_incident=incident,
+            refine_detection=refine_detection,
+            windows=tuple(refine_detection.windows),
+            used_fallback=False,
+            fallback_reason=None,
+        )
+    return RefinedIncident(
+        population_incident=incident,
+        refine_detection=refine_detection,
+        windows=incident.windows,
+        used_fallback=True,
+        fallback_reason=(
+            f"re-detecting on the isolated blast radius over {_fmt_dt(search_start)} to "
+            f"{_fmt_dt(search_end)} found no anomaly window (thin slice, or genuinely no "
+            "signal at that grain) -- using the population-level span instead"
+        ),
+    )
 
 
 async def investigate_pipeline(
@@ -275,9 +381,10 @@ async def investigate_pipeline(
     window: tuple[datetime, datetime],
     description: str,
     merge_gap: timedelta = DEFAULT_MERGE_GAP,
+    refine_padding: timedelta = DEFAULT_REFINE_PADDING,
 ) -> InvestigationReport:
-    """Run detect -> walk (per window) -> merge -> {correlate -> quantify}* (per
-    merged incident), timing every stage.
+    """Run detect -> walk (per window) -> merge -> refine -> {correlate -> quantify}*
+    (per incident), timing every stage.
 
     Raises on the first failing query (QueryError) or bad input -- never builds a
     partial report. A caller only ever sees a report once every stage that ran
@@ -323,31 +430,44 @@ async def investigate_pipeline(
 
     incidents = merge_windows_into_incidents(entries, merge_gap=merge_gap)
 
+    refine_queries: list[ExecutedQuery] = []
+    refine_elapsed_ms = 0.0
+    refined_incidents: list[RefinedIncident] = []
+    for incident in incidents:
+        idx = len(gateway.query_log)
+        stage_started = time.perf_counter()
+        refined = await refine_incident(
+            gateway, incident, metric_name=metric_name, refine_padding=refine_padding
+        )
+        refine_elapsed_ms += (time.perf_counter() - stage_started) * 1000
+        refine_queries.extend(gateway.query_log[idx:])
+        refined_incidents.append(refined)
+
     correlate_queries: list[ExecutedQuery] = []
     quantify_queries: list[ExecutedQuery] = []
     correlate_elapsed_ms = 0.0
     quantify_elapsed_ms = 0.0
     incident_results: list[IncidentInvestigation] = []
 
-    for incident in incidents:
+    for refined in refined_incidents:
         idx = len(gateway.query_log)
         stage_started = time.perf_counter()
         correlation = await correlate_changes(
             gateway,
-            blast_radius=incident.final_slice,
-            anomaly_window=incident.span,
+            blast_radius=refined.final_slice,
+            anomaly_window=refined.span,
             metric_name=metric_name,
         )
         correlate_elapsed_ms += (time.perf_counter() - stage_started) * 1000
         correlate_queries.extend(gateway.query_log[idx:])
 
-        qoe_delta_ratio = _qoe_delta_ratio(incident.peak_window)
+        qoe_delta_ratio = _qoe_delta_ratio(refined.peak_window)
         idx = len(gateway.query_log)
         stage_started = time.perf_counter()
         impact = await _compute_impact(
             gateway,
-            slice_=incident.final_slice,
-            window=incident.span,
+            slice_=refined.final_slice,
+            window=refined.span,
             qoe_delta_ratio=qoe_delta_ratio,
         )
         quantify_elapsed_ms += (time.perf_counter() - stage_started) * 1000
@@ -355,7 +475,7 @@ async def investigate_pipeline(
 
         incident_results.append(
             IncidentInvestigation(
-                incident=incident,
+                incident=refined,
                 correlation=correlation,
                 impact=impact,
                 qoe_delta_ratio=qoe_delta_ratio,
@@ -367,6 +487,7 @@ async def investigate_pipeline(
         startup_timing,
         detect_timing,
         StageTiming("walk", walk_elapsed_ms, tuple(walk_queries)),
+        StageTiming("refine", refine_elapsed_ms, tuple(refine_queries)),
         StageTiming("correlate", correlate_elapsed_ms, tuple(correlate_queries)),
         StageTiming("quantify", quantify_elapsed_ms, tuple(quantify_queries)),
     )
@@ -575,37 +696,50 @@ def _render_no_anomalies(report: InvestigationReport) -> list[str]:
 
 
 def _render_what_happened(ir: IncidentInvestigation, metric_label: str) -> list[str]:
-    incident = ir.incident
-    peak = incident.peak_window
-    span_start, span_end = incident.span
+    refined = ir.incident
+    population = refined.population_incident
+    pop_start, pop_end = population.span
+    pop_peak = population.peak_window
     lines = [
         "WHAT HAPPENED",
-        f"  {metric_label} breached its seasonality-aware threshold intermittently across "
-        f"{_fmt_dt(span_start)} to {_fmt_dt(span_end)}: {incident.anomalous_bucket_count} of "
-        f"{incident.span_bucket_count} five-minute buckets across this span, in "
-        f"{len(incident.windows)} separate burst(s).",
-        "  This is expected of a fault scoped to a narrow slice: measured against the WHOLE",
-        "  population, its signal is diluted and only breaches threshold at its worst peaks;",
-        "  the blast radius below is what makes it one continuous incident.",
-        f"  Worst burst: {_fmt_dt(peak.start)} to {_fmt_dt(peak.end)} -- {metric_label} reached "
-        f"{peak.peak_value:.6g} (expected {peak.expected_at_peak:.6g}), a robust z-score of "
-        f"{peak.peak_z:.1f} sigma.",
-        "",
+        f"  Detected at population level between {_fmt_dt(pop_start)} and {_fmt_dt(pop_end)}, "
+        f"where the diluted signal breached threshold ({population.anomalous_bucket_count} of "
+        f"{population.span_bucket_count} five-minute buckets, in {len(population.windows)} "
+        f"separate burst(s); peak z {pop_peak.peak_z:.1f} sigma).",
     ]
+    if refined.used_fallback:
+        lines.append(f"  Re-examined against the isolated blast radius: {refined.fallback_reason}.")
+    else:
+        refined_start, refined_end = refined.span
+        refined_peak = refined.peak_window
+        lines.append(
+            f"  Re-examined against the isolated blast radius "
+            f"({_humanize_slice(refined.final_slice)}), the fault actually ran "
+            f"{_fmt_dt(refined_start)} to {_fmt_dt(refined_end)} "
+            f"({refined.anomalous_bucket_count} of {refined.span_bucket_count} five-minute "
+            f"buckets breached threshold; peak z {refined_peak.peak_z:.1f} sigma versus "
+            f"{pop_peak.peak_z:.1f} at population level)."
+        )
+    peak = refined.peak_window
+    lines.append(
+        f"  {metric_label} reached {peak.peak_value:.6g} at its worst (expected "
+        f"{peak.expected_at_peak:.6g})."
+    )
+    lines.append("")
     return lines
 
 
 def _render_who_affected(ir: IncidentInvestigation, show_sql: bool) -> list[str]:
-    incident = ir.incident
-    walk_result = incident.representative_walk
+    population = ir.incident.population_incident
+    walk_result = population.representative_walk
     slice_ = walk_result.final_slice
-    peak = incident.peak_window
+    peak = population.peak_window
     lines = [
         "WHO WAS AFFECTED (blast radius)",
         f"  {_humanize_slice(slice_)}",
         "",
-        f"  Drill-down path (from the strongest burst, {_fmt_dt(peak.start)} to "
-        f"{_fmt_dt(peak.end)}):",
+        f"  Drill-down path (from the strongest population-level burst, {_fmt_dt(peak.start)} "
+        f"to {_fmt_dt(peak.end)}):",
     ]
     if not walk_result.path:
         lines.append("    (no refinement -- the anomaly could not be localised below the")
@@ -639,7 +773,7 @@ def _render_probable_cause(ir: IncidentInvestigation, show_sql: bool) -> list[st
                 f"  [change #{top.change_id}] {top.change_type} / {top.component}: "
                 f"{top.description}",
                 f"  Changed at: {_fmt_dt(top.changed_at)} "
-                f"({top.temporal_delta} before the incident's onset)",
+                f"({top.temporal_delta} before the incident's TRUE onset)",
                 f"  Confidence score: {top.score:.2f} "
                 "(temporal proximity x dimensional overlap; 1.0 is the maximum)",
                 f"  Dimensional match: {top.dimension_key} = {top.dimension_value} -- "
@@ -675,7 +809,9 @@ def _render_revenue_impact(ir: IncidentInvestigation, show_sql: bool) -> list[st
         "  Methodology: churn_risk = base_monthly_churn x tenure_multiplier x "
         "severity_multiplier, capped at 1.0;",
         "    arr_at_risk = sum(churn_risk x monthly_arpu x 12) over affected subscribers,",
-        "    measured over the full merged incident span, not a single 5-minute fragment.",
+        "    measured over the TRUE (blast-radius-refined) incident span, not the "
+        "population-level span",
+        "    and not a single 5-minute fragment.",
         f"    base_monthly_churn={m.base_monthly_churn} +/-{m.base_churn_variation:.0%} "
         f"(assumption, not measured); qoe_delta_ratio={m.qoe_delta_ratio:.3f} (from the "
         "incident's worst burst).",
@@ -766,6 +902,7 @@ async def _run(
     window: tuple[datetime, datetime],
     description: str,
     merge_gap: timedelta,
+    refine_padding: timedelta,
 ) -> InvestigationReport:
     async with ClickHouseMCPGateway(config) as gateway:
         return await investigate_pipeline(
@@ -774,6 +911,7 @@ async def _run(
             window=window,
             description=description,
             merge_gap=merge_gap,
+            refine_padding=refine_padding,
         )
 
 
@@ -802,13 +940,19 @@ def investigate(
         help="Merge anomaly windows with the same blast radius into one incident if the "
         "gap between them is at most this many hours.",
     ),
+    refine_padding_hours: float = typer.Option(
+        DEFAULT_REFINE_PADDING.total_seconds() / 3600,
+        "--refine-padding-hours",
+        help="After merging, re-detect on the isolated blast radius over the merged span "
+        "padded by this many hours on each side, to find the incident's true onset/end.",
+    ),
     show_sql: bool = typer.Option(
         False, "--show-sql", help="Print the SQL behind every claim in the brief."
     ),
 ) -> None:
-    """Run a full investigation (detect -> walk -> merge -> correlate -> quantify) with
-    no LLM involved, and print a plain-text incident brief. Every number is traceable to
-    a query the gateway actually ran; pass --show-sql to see them."""
+    """Run a full investigation (detect -> walk -> merge -> refine -> correlate ->
+    quantify) with no LLM involved, and print a plain-text incident brief. Every number
+    is traceable to a query the gateway actually ran; pass --show-sql to see them."""
     load_dotenv(override=False)
     try:
         metric_name, window, description = resolve_investigation(
@@ -823,14 +967,21 @@ def investigate(
             raise InvestigationInputError(
                 f"--merge-gap-hours must be >= 0, got {merge_gap_hours}"
             )
+        if refine_padding_hours < 0:
+            raise InvestigationInputError(
+                f"--refine-padding-hours must be >= 0, got {refine_padding_hours}"
+            )
         merge_gap = timedelta(hours=merge_gap_hours)
+        refine_padding = timedelta(hours=refine_padding_hours)
         config = ClickHouseConfig.from_env()
     except (InvestigationInputError, KeyError, ValueError) as exc:
         typer.echo(f"INVESTIGATION FAILED: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
     try:
-        report = asyncio.run(_run(config, metric_name, window, description, merge_gap))
+        report = asyncio.run(
+            _run(config, metric_name, window, description, merge_gap, refine_padding)
+        )
     except QueryError as exc:
         typer.echo(f"QUERY FAILED: {exc}", err=True)
         raise typer.Exit(code=1) from exc

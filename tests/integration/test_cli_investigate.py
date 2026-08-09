@@ -17,6 +17,7 @@ much smaller here, but the pattern is followed anyway rather than re-litigated p
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,6 +27,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+from continuity.analysis import cli as cli_module
+from continuity.analysis.detect import AnomalyWindow
+from continuity.analysis.slices import Slice
 
 pytestmark = pytest.mark.integration
 
@@ -92,18 +97,23 @@ def _run_cli(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[
 # this frozen, seeded dataset. detect() runs on the WHOLE population, where this slice is
 # only ~8% of sessions -- a diluted signal that breaches threshold at just a handful of
 # peaks, fragmenting into several raw anomaly windows separated by quiet stretches. Merging
-# those windows (continuity/analysis/cli.py::merge_windows_into_incidents) recovers most,
-# but not all, of the true window -- its span runs from the first surviving window's start
-# to the last one's end, which does not reach all the way back to the incident's true onset
-# or all the way to its true offset. The tolerance below is generous for that reason, but it
-# still catches a regression back to the old per-window behaviour, which reported ~356
-# subscribers for a single 25-minute fragment -- roughly a tenth of the true count.
+# those windows recovers ONE incident but still bounds it by the population-level span.
+# Re-detecting on the isolated blast radius (continuity/analysis/cli.py::refine_incident,
+# z 19-83 there versus 4-7 at population level) recovers the true onset/offset almost
+# exactly, which is what makes the tolerance below tight rather than the generous one
+# merging alone could support.
 _TRUE_ROKU_820_SUBSCRIBERS = 3689
-_MIN_ACCEPTABLE_FRACTION = 0.5
+_MIN_ACCEPTABLE_FRACTION = 0.85
 _MAX_ACCEPTABLE_FRACTION = 1.2
 
+_DT_PAIR = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 
-def test_investigate_by_incident_id_merges_windows_into_one_incident_near_true_impact():
+
+def _parse_dt(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+
+
+def test_investigate_by_incident_id_refines_to_the_true_span_and_impact():
     result = _run_cli("--incident", "INC-APP-ROKU-820")
 
     assert result.returncode == 0, result.stderr
@@ -127,6 +137,27 @@ def test_investigate_by_incident_id_merges_windows_into_one_incident_near_true_i
         f"separate incident sections:\n{output}"
     )
 
+    # Re-detecting on the isolated blast radius must recover a span at least as wide as
+    # the population-level one that seeded it -- that is the entire point of refinement.
+    pop_pattern = rf"Detected at population level between {_DT_PAIR} and {_DT_PAIR}"
+    refined_pattern = rf"the fault actually ran {_DT_PAIR} to {_DT_PAIR} \("
+    pop_match = re.search(pop_pattern, output)
+    refined_match = re.search(refined_pattern, output)
+    assert pop_match, f"expected a population-level span line in:\n{output}"
+    assert refined_match, f"expected a refined span line (no fallback) in:\n{output}"
+    pop_start, pop_end = _parse_dt(pop_match.group(1)), _parse_dt(pop_match.group(2))
+    refined_start = _parse_dt(refined_match.group(1))
+    refined_end = _parse_dt(refined_match.group(2))
+    assert refined_end - refined_start >= pop_end - pop_start, (
+        f"refined span {refined_start}..{refined_end} is narrower than the population-level "
+        f"span {pop_start}..{pop_end} it was supposed to widen"
+    )
+
+    # The refined onset must be at or before the population-level detection's first burst,
+    # and the refined end at or after its last -- refinement only ever widens.
+    assert refined_start <= pop_start
+    assert refined_end >= pop_end
+
     subscriber_counts = [
         int(m.group(1).replace(",", ""))
         for m in re.finditer(r"Affected subscribers:\s*([\d,]+)", output)
@@ -134,12 +165,11 @@ def test_investigate_by_incident_id_merges_windows_into_one_incident_near_true_i
     assert len(subscriber_counts) == 1
     count = subscriber_counts[0]
     assert count >= _TRUE_ROKU_820_SUBSCRIBERS * _MIN_ACCEPTABLE_FRACTION, (
-        f"merged subscriber count {count} is too far below the true "
-        f"~{_TRUE_ROKU_820_SUBSCRIBERS} measured over the incident's full window -- looks "
-        "like windows are not merging into one incident"
+        f"refined subscriber count {count} is too far below the true "
+        f"~{_TRUE_ROKU_820_SUBSCRIBERS} measured over the incident's full window"
     )
     assert count <= _TRUE_ROKU_820_SUBSCRIBERS * _MAX_ACCEPTABLE_FRACTION, (
-        f"merged subscriber count {count} overshoots the true ~{_TRUE_ROKU_820_SUBSCRIBERS} "
+        f"refined subscriber count {count} overshoots the true ~{_TRUE_ROKU_820_SUBSCRIBERS} "
         "by more than expected"
     )
 
@@ -150,9 +180,90 @@ def test_investigate_by_incident_id_merges_windows_into_one_incident_near_true_i
     assert dollar_figures, "expected a dollar figure in the brief"
     assert dollar_figures[0] > 1000, f"expected a substantial ARR figure, got {dollar_figures}"
 
+    # Correlating against the TRUE (refined) onset must score at least as well as
+    # correlating against the first population-level peak did before refinement (0.22).
+    score_match = re.search(r"Confidence score: ([\d.]+)", output)
+    assert score_match, f"expected a confidence score line in:\n{output}"
+    assert float(score_match.group(1)) > 0.3, (
+        f"expected refinement to improve the correlation score above the pre-refinement "
+        f"0.22, got {score_match.group(1)}"
+    )
+
     # The recommended action is explicitly a proposal, never framed as already done.
     assert "PROPOSAL" in output
     assert "REQUIRES HUMAN APPROVAL" in output
+
+
+# --- the fallback path: refinement must never silently produce a worse answer --------
+
+
+def _fake_anomaly_window(start: datetime, end: datetime, peak_z: float = 5.0) -> AnomalyWindow:
+    return AnomalyWindow(
+        slice=Slice(),
+        metric="rebuffer",
+        start=start,
+        end=end,
+        peak_z=peak_z,
+        peak_value=0.01,
+        expected_at_peak=0.002,
+        bucket_count=max(1, int((end - start) / timedelta(minutes=5))),
+        sql="SELECT 1",
+    )
+
+
+def _fake_walk_result(final_slice: Slice, window: tuple[datetime, datetime]):
+    return cli_module.WalkResult(
+        metric="rebuffer",
+        window=window,
+        baseline_windows=(),
+        path=(),
+        final_slice=final_slice,
+        stop_reason=cli_module.StopReason.DIMENSIONS_EXHAUSTED,
+        stop_detail="test fixture",
+        elapsed_ms=0.0,
+        query_log=(),
+    )
+
+
+def test_refine_incident_falls_back_to_the_population_span_when_it_finds_nothing(monkeypatch):
+    """`refine_incident` re-detects on the isolated blast radius -- a pure orchestration
+    step this test exercises directly (no DB needed: `detect` is monkeypatched) rather
+    than trying to provoke a thin-slice fallback from live data, which cannot be forced
+    without hardcoding a fragile dataset property. Never touches the network."""
+    slice_ = Slice().refine("device_type", "roku")
+    pop_start = datetime(2026, 2, 12, 19, 40, 0)
+    pop_end = datetime(2026, 2, 12, 20, 15, 0)
+    window = _fake_anomaly_window(pop_start, pop_end)
+    walk_result = _fake_walk_result(slice_, (pop_start, pop_end))
+    incident = cli_module.MergedIncident(windows=(window,), walks=(walk_result,))
+
+    async def fake_detect(gateway, slice_arg, metric_name, start, end, **kwargs):
+        assert slice_arg == slice_
+        return cli_module.DetectionResult(
+            slice=slice_arg,
+            metric=metric_name,
+            windows=[],
+            total_buckets=1,
+            anomalous_buckets=0,
+            unknown_buckets=0,
+            sql="SELECT 1",
+        )
+
+    monkeypatch.setattr(cli_module, "detect", fake_detect)
+    refined = asyncio.run(
+        cli_module.refine_incident(
+            object(),  # never touched: detect() is mocked
+            incident,
+            metric_name="rebuffer",
+            refine_padding=timedelta(hours=6),
+        )
+    )
+
+    assert refined.used_fallback is True
+    assert refined.fallback_reason is not None
+    assert "population-level span" in refined.fallback_reason
+    assert refined.span == incident.span
+    assert refined.windows == incident.windows
 
 
 # --- --show-sql is the anti-hallucination property, not decoration -------------------
