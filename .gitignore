@@ -15,3 +15,5 @@ build/
 data/*.json
 data/*.parquet
 data/*.csv
+data/*.log
+data/*.err
