@@ -62,6 +62,25 @@ There is no Gemini 3.x Pro tier here, so the design cannot assume one. Default t
 hard for Flash. Note the Vertex location (`global`) is independent of the Cloud Run
 deploy region (`us-central1`) — keep them as separate settings.
 
+### ADK runtime — proven end to end, 2026-08-08
+
+All four verified against the real project and real credentials, not documentation:
+
+| Fact | Verified |
+|---|---|
+| `google-adk` 2.6.3 declares `mcp>=1.24,<2` under its `mcp` extra | matches the pin already forced by the fastmcp break — no conflict |
+| `google-adk` + `mcp-clickhouse` coexist | adk 2.6.3, google-genai 2.17.0, mcp 1.29.0, fastmcp 2.14.7 |
+| Import paths | `from google.adk.agents import LlmAgent, SequentialAgent`; `from google.adk.tools.mcp_tool import McpToolset`; `from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams`; `from mcp import StdioServerParameters` |
+| `McpToolset(tool_filter=[...])` | constructs against the real server; restrict the agent to `run_query`, `list_tables`, `list_databases` — read-only by construction |
+| `LlmAgent` → `gemini-3.6-flash` on Vertex | replies correctly with `GOOGLE_CLOUD_LOCATION=global` |
+| Pydantic `output_schema` | round-trips as valid JSON, so typed stage contracts are real |
+
+Install with the extra: `google-adk[mcp]`.
+
+**`GOOGLE_CLOUD_LOCATION` must be `global`.** With `us-central1` every call returns
+404 NOT_FOUND for a model that only serves globally. `.env` is gitignored, so
+`tests/test_env_completeness.py` guards against it drifting behind `.env.example`.
+
 ---
 
 ## Commands
