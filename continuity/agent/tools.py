@@ -7,14 +7,26 @@ numbers. A number must never originate in the model -- every tool result below
 carries the SQL that produced it, so any figure that later shows up in a brief
 without a matching logged query is mechanically detectable as a fabrication.
 
-Five tools, one per analysis primitive from ``continuity/analysis``:
+Seven tools, composed from the analysis primitives in ``continuity/analysis``:
 
-* ``detect_anomalies``  -- wraps ``detect.detect``
-* ``measure_slice``     -- wraps ``baseline.compute_baseline`` over a whole-window
+* ``detect_anomalies``     -- wraps ``detect.detect``
+* ``measure_slice``        -- wraps ``baseline.compute_baseline`` over a whole-window
   aggregate (see its docstring for why this is coarser than bucket-level detection)
-* ``split_on_dimension`` -- wraps ``split.split_dimensions_median_baseline``
-* ``find_changes``      -- wraps ``correlate.correlate_changes``
-* ``quantify_impact``   -- wraps ``impact.compute_impact``
+* ``split_on_dimension``   -- wraps ``split.split_dimensions_median_baseline`` for ONE
+  dimension
+* ``split_all_dimensions`` -- wraps the same batched primitive for EVERY candidate
+  dimension not already pinned in the slice, in one call -- the tool that replaces
+  what used to be many separate ``split_on_dimension`` calls
+* ``refine_incident_span`` -- composes ``detect.detect`` and
+  ``continuity.analysis.cli._typical_and_peak_deviation`` (the same functions
+  ``cli.refine_incident`` composes) to find a localized slice's TRUE onset/end and its
+  TYPICAL/PEAK severity, instead of the diluted population-level span that first
+  surfaced it
+* ``find_changes``         -- wraps ``correlate.correlate_changes``
+* ``quantify_impact``      -- wraps ``impact.compute_impact``, computing its own
+  severity input (the TYPICAL deviation ratio, via ``detect`` +
+  ``_typical_and_peak_deviation``) rather than accepting one as a parameter -- see that
+  method's docstring for why severity must never be something the model supplies.
 
 This module makes **no LLM calls** and imports nothing outside the analysis core,
 the gateway and ``google.adk.tools`` (for the ``FunctionTool`` wrapper type itself,
@@ -28,7 +40,7 @@ never sees ``gateway`` as an argument -- it is a bound instance attribute, not a
 parameter of the wrapped function, so ADK's schema derivation (which reads the
 function's signature) never exposes it and never asks the model to supply one.
 ``build_function_tools(gateway)`` is the one-line entry point sub-project 3's
-agent uses to get the five ``FunctionTool``s for an ``LlmAgent``.
+agent uses to get the seven ``FunctionTool``s for an ``LlmAgent``.
 
 ERROR SHAPE. Every tool method returns a plain dict. On success, the dict carries
 the measurement plus its SQL. On failure, it carries ``{"error": <message>,
@@ -72,6 +84,7 @@ from typing import Any
 from google.adk.tools import FunctionTool
 
 from continuity.analysis.baseline import DEFAULT_LOOKBACK_WEEKS, Baseline, compute_baseline
+from continuity.analysis.cli import DEFAULT_REFINE_PADDING, _typical_and_peak_deviation
 from continuity.analysis.correlate import (
     InvalidCorrelationWindowError,
     RankedChange,
@@ -84,6 +97,7 @@ from continuity.analysis.metrics import Metric, get_metric
 from continuity.analysis.slices import InvalidSliceError, Slice
 from continuity.analysis.split import Contribution, split_dimensions_median_baseline
 from continuity.analysis.walk import week_over_week_baseline_windows
+from continuity.data.topology import DIMENSION_HIERARCHY
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
 
 DEFAULT_TOP_N = 8
@@ -276,7 +290,7 @@ def _methodology_dict(methodology: Methodology) -> dict[str, Any]:
 
 
 class AnalysisTools:
-    """The five analysis primitives, bound to one live `ClickHouseMCPGateway`.
+    """The seven analysis primitives, bound to one live `ClickHouseMCPGateway`.
 
     Construct once per investigation (or per agent session) and either call the
     methods directly, or hand `function_tools()` to an ADK `LlmAgent`. `gateway`
@@ -628,6 +642,279 @@ class AnalysisTools:
         }
 
     # ------------------------------------------------------------------
+    # split_all_dimensions
+    # ------------------------------------------------------------------
+
+    async def split_all_dimensions(
+        self,
+        slice_json: dict[str, str] | str,
+        metric: str,
+        window_start: str,
+        window_end: str,
+    ) -> dict[str, Any]:
+        """Break `slice_json` down by EVERY candidate dimension not already pinned in it, all
+        in ONE call -- CALL THIS FIRST when deciding what to descend into next, before
+        reaching for `split_on_dimension` one dimension at a time.
+
+        This is the same batched, single-UNION-ALL-per-window primitive
+        `split_on_dimension` uses, just run once for every remaining dimension instead of
+        once per dimension -- measured at ~43ms for all 8 dimensions versus ~183ms
+        issuing them one at a time. Splitting device_type, app_version, cdn, isp,
+        country, region, os_version and pop as 8 separate tool calls costs 8 turns of
+        model reasoning and 8x the tokens for information this ONE call already
+        contains. Only fall back to `split_on_dimension` for a closer look at one
+        dimension you have already identified as promising (e.g. a larger `top_n`, or to
+        re-check it after refining the slice further) -- or for `title_id`, which is
+        NOT a candidate here (it forces the raw-events table and its numeric value
+        column cannot be batched into the same UNION ALL as the other dimensions'
+        string columns); split on it explicitly with `split_on_dimension` if you
+        suspect a per-title fault.
+
+        For each candidate dimension, only its TOP-ranked value (by contribution) is
+        returned, ranked across dimensions by that value's LIFT -- the signal to act on,
+        exactly as `split_on_dimension` explains: lift ~1.0 means a value is just a big
+        population segment, not a cause; lift meaningfully above 1.0 (roughly above 1.5)
+        means it is genuinely worse than its size predicts and worth descending into.
+
+        Args:
+            slice_json: A JSON object (or JSON-encoded string) of dimension -> value
+                already fixed, or `{}`/`""` to split the whole population. Every
+                dimension already a key here is automatically excluded from the result
+                -- you cannot split a dimension you have already pinned.
+            metric: One of the known metric names (`"rebuffer"`, `"startup"`, `"bitrate"`,
+                `"errors"`). An unknown name comes back as `"invalid_input"`.
+            window_start: ISO-8601 datetime, inclusive start of the window being
+                investigated.
+            window_end: ISO-8601 datetime, exclusive end of the window being
+                investigated. Must be after `window_start`.
+
+        Returns:
+            On success, a dict with:
+            - `dimensions`: one entry per candidate dimension (every dimension in
+              `topology.DIMENSION_HIERARCHY` not already pinned in `slice_json` --
+              `title_id` is never a candidate here, see above), sorted by `lift`
+              descending (a `None` lift sorts last). Each entry carries `dimension`,
+              `informative` (see `split_on_dimension`), `top_value`, `weight_share`,
+              `share_of_deviation`, `lift`, and `note` (why a field is `None`, or
+              `"no data for this dimension in the window"` when the dimension had no
+              rows at all here).
+            - `sql`, `baseline_sql`: the one batched query (per window) behind every
+              dimension's result -- all dimensions share the same two queries, so this
+              is not repeated per dimension.
+
+            If `slice_json` already pins every candidate dimension, `dimensions` is an
+            empty list with a `note` explaining there is nothing left to split -- a
+            real finding, not an error.
+
+            On failure, `{"error": ..., "error_type": ...}` -- see the module docstring.
+
+            What this tool does NOT tell you: a value beyond each dimension's own top
+            one -- call `split_on_dimension` with a larger `top_n` for that, or for
+            `title_id`. It also does not tell you the TRUE onset/end of the incident on
+            the slice you pick -- call `refine_incident_span` for that once localized.
+        """
+        try:
+            slice_ = _parse_slice(slice_json)
+            metric_obj = get_metric(metric)
+            window = _parse_window(
+                window_start, window_end, start_name="window_start", end_name="window_end"
+            )
+        except (InvalidSliceError, KeyError, ValueError) as exc:
+            return _error(str(exc), "invalid_input")
+
+        candidate_dimensions = sorted(d for d in DIMENSION_HIERARCHY if d not in slice_.dimensions)
+        if not candidate_dimensions:
+            return {
+                "slice": _slice_repr(slice_),
+                "metric": metric,
+                "window_start": window[0].isoformat(),
+                "window_end": window[1].isoformat(),
+                "dimensions": [],
+                "note": "every dimension is already pinned in this slice -- nothing left to split",
+            }
+
+        baseline_windows = week_over_week_baseline_windows(window, DEFAULT_LOOKBACK_WEEKS)
+        try:
+            results = await split_dimensions_median_baseline(
+                self._gateway,
+                slice_=slice_,
+                metric=metric_obj,
+                dimensions=candidate_dimensions,
+                window=window,
+                baseline_windows=baseline_windows,
+            )
+        except InvalidSliceError as exc:
+            return _error(str(exc), "invalid_input")
+        except QueryError as exc:
+            return _error(str(exc), "infrastructure_failure")
+
+        ranked: list[dict[str, Any]] = []
+        for dimension in candidate_dimensions:
+            result = results[dimension]
+            top = result.values[0] if result.values else None
+            ranked.append(
+                {
+                    "dimension": dimension,
+                    "informative": result.informative,
+                    "top_value": top.value if top is not None else None,
+                    "weight_share": top.weight_share if top is not None else None,
+                    "share_of_deviation": top.share_of_deviation if top is not None else None,
+                    "lift": top.lift if top is not None else None,
+                    "note": (
+                        top.note
+                        if top is not None
+                        else "no data for this dimension in the window"
+                    ),
+                }
+            )
+
+        def _lift_sort_key(entry: dict[str, Any]) -> tuple[bool, float]:
+            lift = entry["lift"]
+            return (lift is None, -(lift or 0.0))
+
+        ranked.sort(key=_lift_sort_key)
+
+        sample_result = next(iter(results.values()))
+        return {
+            "slice": _slice_repr(slice_),
+            "metric": metric,
+            "window_start": window[0].isoformat(),
+            "window_end": window[1].isoformat(),
+            "dimensions": ranked,
+            "sql": sample_result.sql,
+            "baseline_sql": sample_result.baseline_sql,
+        }
+
+    # ------------------------------------------------------------------
+    # refine_incident_span
+    # ------------------------------------------------------------------
+
+    async def refine_incident_span(
+        self,
+        slice_json: dict[str, str] | str,
+        metric: str,
+        approx_start: str,
+        approx_end: str,
+    ) -> dict[str, Any]:
+        """Re-detect `metric` directly on `slice_json` (never the whole population) to find
+        this incident's TRUE onset/end and its TYPICAL severity -- call this AFTER you
+        have localized a blast radius and BEFORE `quantify_impact`.
+
+        `approx_start`/`approx_end` is typically the population-level window a
+        population-level `detect_anomalies` call handed you. A fault scoped to a narrow
+        slice is a diluted signal at population level -- it only breaches the detection
+        threshold at its worst peaks, understating both the true span and the true
+        severity. Re-running detection directly on the isolated slice sees a far
+        stronger signal (measured on a real incident: z 23 on the isolated slice versus
+        z 7 at population level) and recovers the shoulders before the first peak and
+        after the last one that population-level detection misses entirely. This
+        composes `continuity.analysis.detect.detect` and the same median-severity
+        computation `continuity.analysis.cli.refine_incident` uses -- it does not
+        reimplement either.
+
+        Args:
+            slice_json: A JSON object (or JSON-encoded string) of dimension -> value
+                describing the blast radius to refine, e.g. `{"device_type": "roku",
+                "app_version": "8.2.0"}`. Refining the whole population (`{}`/`""`) is
+                allowed but rarely useful.
+            metric: One of the known metric names (`"rebuffer"`, `"startup"`, `"bitrate"`,
+                `"errors"`). An unknown name comes back as `"invalid_input"`.
+            approx_start: ISO-8601 datetime, your current best guess at when the
+                incident started (e.g. from `detect_anomalies` at population level).
+            approx_end: ISO-8601 datetime, your current best guess at when it ended.
+                Must be after `approx_start`.
+
+        Returns:
+            On success, a dict with:
+            - `input_start`/`input_end`: the population-level span you started from,
+              echoed back for reference.
+            - `refined`: `True` if re-detecting directly on the isolated slice found a
+              signal, `False` if it found nothing (a thin slice, or genuinely no
+              incident here at this grain).
+            - `start`/`end`: the TRUE onset/end on this slice when `refined` is `True`;
+              otherwise EXACTLY `input_start`/`input_end`, unchanged -- refinement never
+              silently returns something worse than the span you already had.
+            - `buckets_breached`: how many 5-minute buckets crossed the anomaly
+              threshold on this slice while re-detecting (0 when `refined` is `False`).
+            - `typical_severity_ratio`: the MEDIAN `(actual - expected) / expected`
+              across every anomalous bucket in the refined span -- what subscribers
+              TYPICALLY experienced. `None` when `refined` is `False`.
+            - `peak_severity_ratio`: the single worst bucket's own ratio, carried
+              alongside the typical figure for transparency only -- `quantify_impact`
+              computes severity itself from the typical figure, never from a number you
+              pass it. `None` when `refined` is `False`.
+            - `sql`: the query that scanned the isolated slice for anomaly windows.
+            - `severity_sql`: the query behind `typical_severity_ratio` /
+              `peak_severity_ratio` (present only when `refined` is `True`).
+            - `note`: present only when `refined` is `False`, explaining why.
+
+            On failure, `{"error": ..., "error_type": ...}` -- see the module docstring.
+
+            What this tool does NOT do: compute business impact -- call
+            `quantify_impact` with the refined `start`/`end` for that; it derives
+            severity on its own, never from this tool's output.
+        """
+        try:
+            slice_ = _parse_slice(slice_json)
+            get_metric(metric)
+            window = _parse_window(
+                approx_start, approx_end, start_name="approx_start", end_name="approx_end"
+            )
+        except (InvalidSliceError, KeyError, ValueError) as exc:
+            return _error(str(exc), "invalid_input")
+
+        search_start = window[0] - DEFAULT_REFINE_PADDING
+        search_end = window[1] + DEFAULT_REFINE_PADDING
+        try:
+            refine_detection = await detect(self._gateway, slice_, metric, search_start, search_end)
+        except QueryError as exc:
+            return _error(str(exc), "infrastructure_failure")
+
+        base = {
+            "slice": _slice_repr(slice_),
+            "metric": metric,
+            "input_start": window[0].isoformat(),
+            "input_end": window[1].isoformat(),
+            "sql": refine_detection.sql,
+        }
+
+        if not refine_detection.windows:
+            return {
+                **base,
+                "refined": False,
+                "start": window[0].isoformat(),
+                "end": window[1].isoformat(),
+                "buckets_breached": 0,
+                "typical_severity_ratio": None,
+                "peak_severity_ratio": None,
+                "note": (
+                    "re-detecting directly on this slice found no anomaly window over "
+                    f"{_fmt(search_start)}..{_fmt(search_end)} -- returning the input span "
+                    "unchanged (thin slice, or genuinely no signal here at this grain), "
+                    "never a worse guess than what you already had"
+                ),
+            }
+
+        windows = refine_detection.windows
+        try:
+            typical_ratio, peak_ratio, severity_sql = await _typical_and_peak_deviation(
+                self._gateway, slice_=slice_, metric_name=metric, windows=windows
+            )
+        except QueryError as exc:
+            return _error(str(exc), "infrastructure_failure")
+
+        return {
+            **base,
+            "refined": True,
+            "start": windows[0].start.isoformat(),
+            "end": windows[-1].end.isoformat(),
+            "buckets_breached": refine_detection.anomalous_buckets,
+            "typical_severity_ratio": float(typical_ratio),
+            "peak_severity_ratio": float(peak_ratio),
+            "severity_sql": severity_sql,
+        }
+
+    # ------------------------------------------------------------------
     # find_changes
     # ------------------------------------------------------------------
 
@@ -719,33 +1006,42 @@ class AnalysisTools:
     async def quantify_impact(
         self,
         slice_json: dict[str, str] | str,
+        metric: str,
         window_start: str,
         window_end: str,
-        severity_ratio: float,
     ) -> dict[str, Any]:
         """Turn `slice_json`'s affected subscribers over `[window_start, window_end)` into an
         ARR-at-risk band, using a transparent, documented churn heuristic (not a trained model).
 
-        `severity_ratio` -- how much worse the driving metric got vs its own
-        baseline, e.g. `(actual - baseline) / baseline` from `measure_slice` or
-        `split_on_dimension` -- feeds a saturating severity multiplier; it does
-        not change WHICH subscribers count as affected (that is purely
-        `slice_json` and the window), only how severely each affected
-        subscriber's churn risk is scored.
+        THERE IS NO SEVERITY PARAMETER HERE -- this tool measures severity itself,
+        directly from `slice_json` and the window, exactly as
+        `continuity.analysis.cli.refine_incident` does: it re-detects anomalous buckets
+        on this slice over this window and takes the MEDIAN `(actual - expected) /
+        expected` across them (what subscribers TYPICALLY experienced), never the peak
+        or a number you invent. `window_start`/`window_end` should be the slice's TRUE
+        span -- call `refine_incident_span` first if you have not already, since a
+        loosely-guessed window may contain no measurable anomaly here at all.
 
         Args:
             slice_json: A JSON object (or JSON-encoded string) of dimension ->
                 value describing who was affected, or `{}`/`""` for the whole
                 population.
+            metric: One of the known metric names (`"rebuffer"`, `"startup"`,
+                `"bitrate"`, `"errors"`) -- the metric that drove the incident, used
+                to measure severity on this slice. An unknown name comes back as
+                `"invalid_input"`.
             window_start: ISO-8601 datetime, inclusive start of the impact
                 window.
             window_end: ISO-8601 datetime, exclusive end of the impact window.
                 Must be after `window_start`.
-            severity_ratio: Non-negative. How much worse the metric got vs
-                baseline; `0.0` if you have no better estimate.
 
         Returns:
             On success, a dict with:
+            - `typical_severity_ratio`: the MEDIAN deviation ratio this tool measured
+              and used as the churn heuristic's severity input.
+            - `peak_severity_ratio`: the single worst bucket's own ratio, carried
+              alongside for transparency only -- NOT what was used for the churn
+              multiplier.
             - `affected_subscribers`: count of distinct subscribers with at
               least one session in `slice_json` during the window.
             - `arr_at_risk_low`/`_expected`/`_high`: a BAND, not a point
@@ -756,43 +1052,68 @@ class AnalysisTools:
               this dataset to calibrate against) plus free-text `notes`. Surface
               this alongside the number, not just the number -- that is the
               whole point of it being data rather than a docstring.
-            - `sql`: the query that found the affected subscribers.
+            - `sql`, `severity_sql`, `detect_sql`: every query behind these figures.
 
             `affected_subscribers = 0` is a real, legitimate finding (this slice
             genuinely affected nobody), not an error.
 
-            What this tool does NOT tell you: whether `severity_ratio` you
-            supplied is itself correct -- that number must come from
-            `measure_slice` or `split_on_dimension`, never invented.
+            If no anomalous bucket can be found on this slice in this window,
+            severity cannot be measured here -- this returns `{"error": ...,
+            "error_type": "no_data"}` naming `detect_anomalies`/`refine_incident_span`
+            as the next step, rather than fabricating a severity of `0.0`.
         """
         try:
             slice_ = _parse_slice(slice_json)
+            get_metric(metric)
             window = _parse_window(
                 window_start, window_end, start_name="window_start", end_name="window_end"
             )
-            if severity_ratio < 0:
-                raise ValueError(f"severity_ratio must be >= 0, got {severity_ratio}")
-        except (InvalidSliceError, ValueError) as exc:
+        except (InvalidSliceError, KeyError, ValueError) as exc:
             return _error(str(exc), "invalid_input")
 
         try:
+            detection = await detect(self._gateway, slice_, metric, window[0], window[1])
+        except QueryError as exc:
+            return _error(str(exc), "infrastructure_failure")
+
+        if not detection.windows:
+            return _error(
+                f"no anomalous window found for this slice in {window_start}..{window_end} -- "
+                "severity cannot be measured here. Call detect_anomalies or "
+                "refine_incident_span first to find this slice's true anomalous span "
+                "before quantifying impact.",
+                "no_data",
+            )
+
+        try:
+            typical_ratio, peak_ratio, severity_sql = await _typical_and_peak_deviation(
+                self._gateway, slice_=slice_, metric_name=metric, windows=detection.windows
+            )
+        except QueryError as exc:
+            return _error(str(exc), "infrastructure_failure")
+
+        try:
             result = await compute_impact(
-                self._gateway, slice_=slice_, window=window, qoe_delta_ratio=severity_ratio
+                self._gateway, slice_=slice_, window=window, qoe_delta_ratio=typical_ratio
             )
         except QueryError as exc:
             return _error(str(exc), "infrastructure_failure")
 
         return {
             "slice": _slice_repr(slice_),
+            "metric": metric,
             "window_start": window[0].isoformat(),
             "window_end": window[1].isoformat(),
-            "severity_ratio": severity_ratio,
+            "typical_severity_ratio": float(typical_ratio),
+            "peak_severity_ratio": float(peak_ratio),
             "affected_subscribers": result.affected_subscribers,
             "arr_at_risk_low": str(result.arr_at_risk_low),
             "arr_at_risk_expected": str(result.arr_at_risk_expected),
             "arr_at_risk_high": str(result.arr_at_risk_high),
             "methodology": _methodology_dict(result.methodology),
             "sql": result.sql,
+            "severity_sql": severity_sql,
+            "detect_sql": detection.sql,
         }
 
     # ------------------------------------------------------------------
@@ -800,12 +1121,14 @@ class AnalysisTools:
     # ------------------------------------------------------------------
 
     def function_tools(self) -> list[FunctionTool]:
-        """The five bound methods above, wrapped as ADK `FunctionTool`s ready to
+        """The seven bound methods above, wrapped as ADK `FunctionTool`s ready to
         hand to an `LlmAgent`. Construction only -- this never calls a model."""
         return [
             FunctionTool(self.detect_anomalies),
             FunctionTool(self.measure_slice),
             FunctionTool(self.split_on_dimension),
+            FunctionTool(self.split_all_dimensions),
+            FunctionTool(self.refine_incident_span),
             FunctionTool(self.find_changes),
             FunctionTool(self.quantify_impact),
         ]
@@ -814,6 +1137,6 @@ class AnalysisTools:
 def build_function_tools(
     gateway: ClickHouseMCPGateway, *, default_top_n: int = DEFAULT_TOP_N
 ) -> list[FunctionTool]:
-    """Bind `gateway` and return the five analysis-primitive tools as ADK
+    """Bind `gateway` and return the seven analysis-primitive tools as ADK
     `FunctionTool`s -- the one-line entry point sub-project 3's agent uses."""
     return AnalysisTools(gateway, default_top_n=default_top_n).function_tools()

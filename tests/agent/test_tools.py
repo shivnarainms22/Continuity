@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 from continuity.agent.tools import DEFAULT_TOP_N, AnalysisTools, build_function_tools
+from continuity.analysis.baseline import DEFAULT_LOOKBACK_WEEKS
+from continuity.data.topology import DIMENSION_HIERARCHY
 from continuity.gateway.mcp_gateway import QueryError, QueryResult
 
 # ---------------------------------------------------------------------------
@@ -258,24 +260,36 @@ async def test_find_changes_success_carries_sql():
     assert result["rejected"] == []
 
 
-async def test_quantify_impact_success_carries_sql():
-    tools = AnalysisTools(_FakeGateway([_qr([])]))  # no affected subscribers
+async def test_quantify_impact_returns_no_data_when_no_anomaly_window_is_found():
+    """quantify_impact measures its own severity -- see the module docstring's
+    "DEFECT 2" fix -- so with zero observations (no anomaly window at all) it must
+    report no_data rather than fabricate a severity of 0.0."""
+    tools = AnalysisTools(_FakeGateway([_qr([])]))  # zero observations -> no windows
 
-    result = await tools.quantify_impact({}, _WINDOW_START, _WINDOW_END, 0.5)
+    result = await tools.quantify_impact({}, "rebuffer", _WINDOW_START, "2026-02-12T18:20:00")
 
-    assert "error" not in result
-    assert result["sql"] and "SELECT" in result["sql"]
-    assert result["affected_subscribers"] == 0
-    assert result["arr_at_risk_expected"] == "0.00"
-    assert "notes" in result["methodology"]
+    assert result["error_type"] == "no_data"
+    assert "refine_incident_span" in result["error"] or "detect_anomalies" in result["error"]
 
 
-async def test_quantify_impact_rejects_negative_severity_ratio():
-    tools = AnalysisTools(_FakeGateway([]))
+async def test_quantify_impact_has_no_severity_ratio_parameter():
+    """DEFECT 2: severity_ratio must be unrepresentable, not merely discouraged."""
+    import inspect
 
-    result = await tools.quantify_impact({}, _WINDOW_START, _WINDOW_END, -0.5)
+    params = set(inspect.signature(AnalysisTools.quantify_impact).parameters)
+    assert "severity_ratio" not in params
+    assert {"slice_json", "metric", "window_start", "window_end"} <= params
+
+
+async def test_quantify_impact_rejects_unknown_metric_before_any_query():
+    fake = _FakeGateway([])
+    tools = AnalysisTools(fake)
+
+    result = await tools.quantify_impact({}, "throughput", _WINDOW_START, _WINDOW_END)
 
     assert result["error_type"] == "invalid_input"
+    assert "rebuffer" in result["error"]
+    assert fake.queries == []
 
 
 # ---------------------------------------------------------------------------
@@ -397,12 +411,169 @@ async def test_split_on_dimension_unknown_dimension_is_invalid_input_before_any_
 
 
 # ---------------------------------------------------------------------------
+# split_all_dimensions: DEFECT 3 -- every candidate dimension in one call, ranked
+# by lift, excluding whatever is already pinned in the slice.
+# ---------------------------------------------------------------------------
+
+
+def _split_all_responses() -> list[QueryResult]:
+    """Only `app_version` carries real rows (two values, one wildly worse -> high
+    lift); every other candidate dimension has no rows at all, so the tool must
+    report those as "no data" rather than erroring the whole call."""
+    window_rows = [
+        {"dim": "app_version", "value": "8.2.0", "metric_value": 0.05, "weight": 10_000.0},
+        {"dim": "app_version", "value": "8.1.0", "metric_value": 0.001, "weight": 10_000.0},
+    ]
+    baseline_rows = [
+        {"dim": "app_version", "value": "8.2.0", "metric_value": 0.001, "weight": 10_000.0},
+        {"dim": "app_version", "value": "8.1.0", "metric_value": 0.001, "weight": 10_000.0},
+    ]
+    return [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+
+
+async def test_split_all_dimensions_ranks_by_lift_and_excludes_the_pinned_dimension():
+    fake = _FakeGateway(_split_all_responses())
+    tools = AnalysisTools(fake)
+
+    result = await tools.split_all_dimensions(
+        {"device_type": "roku"}, "rebuffer", _WINDOW_START, _WINDOW_END
+    )
+
+    assert "error" not in result, result
+    names = [d["dimension"] for d in result["dimensions"]]
+    assert "device_type" not in names  # already pinned -- excluded from candidates
+    assert names[0] == "app_version"
+    top = result["dimensions"][0]
+    assert top["top_value"] == "8.2.0"
+    assert top["lift"] is not None and top["lift"] > 1.5
+    assert result["sql"] and result["baseline_sql"]
+
+
+async def test_split_all_dimensions_reports_dimensions_with_no_rows_as_no_data():
+    tools = AnalysisTools(_FakeGateway(_split_all_responses()))
+
+    result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    no_data = next(d for d in result["dimensions"] if d["dimension"] == "cdn")
+    assert no_data["top_value"] is None
+    assert no_data["lift"] is None
+    assert "no data" in no_data["note"]
+    # None-lift dimensions must not be ranked above the real signal.
+    assert result["dimensions"][0]["dimension"] == "app_version"
+
+
+async def test_split_all_dimensions_never_includes_title_id():
+    """title_id forces the raw-events table and its numeric value column cannot be
+    batched into the same UNION ALL as the other (string-valued) dimensions --
+    split_on_dimension remains the way to investigate it."""
+    tools = AnalysisTools(_FakeGateway(_split_all_responses()))
+
+    result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert "title_id" not in {d["dimension"] for d in result["dimensions"]}
+
+
+async def test_split_all_dimensions_issues_exactly_one_query_pair_for_every_dimension():
+    """The whole point of DEFECT 3: one batched window query and one batched
+    baseline query per lookback week, never one pair per dimension."""
+    fake = _FakeGateway(_split_all_responses())
+    tools = AnalysisTools(fake)
+
+    await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert len(fake.queries) == 1 + DEFAULT_LOOKBACK_WEEKS
+
+
+async def test_split_all_dimensions_returns_empty_list_when_every_dimension_is_pinned():
+    slice_json = {d: "x" for d in DIMENSION_HIERARCHY}
+    fake = _FakeGateway([])
+    tools = AnalysisTools(fake)
+
+    result = await tools.split_all_dimensions(slice_json, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert result["dimensions"] == []
+    assert "note" in result
+    assert fake.queries == []
+
+
+async def test_split_all_dimensions_unknown_metric_is_invalid_input_before_any_query():
+    fake = _FakeGateway([])
+    tools = AnalysisTools(fake)
+
+    result = await tools.split_all_dimensions({}, "throughput", _WINDOW_START, _WINDOW_END)
+
+    assert result["error_type"] == "invalid_input"
+    assert fake.queries == []
+
+
+async def test_split_all_dimensions_reports_infrastructure_failure():
+    tools = AnalysisTools(_FakeGateway([QueryError("connection reset")]))
+
+    result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert result["error_type"] == "infrastructure_failure"
+
+
+# ---------------------------------------------------------------------------
+# refine_incident_span: DEFECT 1 -- re-detect directly on the slice to find its
+# true onset/end, never silently returning something worse than the input span.
+# ---------------------------------------------------------------------------
+
+
+async def test_refine_incident_span_returns_input_span_unchanged_when_nothing_found():
+    """A thin slice (or a genuinely quiet one): re-detection finds no window, so
+    the tool must say so explicitly and hand back the input span verbatim."""
+    tools = AnalysisTools(_FakeGateway([_qr([])]))  # zero observations -> no windows
+
+    result = await tools.refine_incident_span(
+        {"device_type": "roku"}, "rebuffer", _WINDOW_START, _WINDOW_END
+    )
+
+    assert "error" not in result, result
+    assert result["refined"] is False
+    assert result["start"] == result["input_start"]
+    assert result["end"] == result["input_end"]
+    assert result["buckets_breached"] == 0
+    assert result["typical_severity_ratio"] is None
+    assert result["peak_severity_ratio"] is None
+    assert result["note"]
+
+
+async def test_refine_incident_span_unknown_metric_is_invalid_input_before_any_query():
+    fake = _FakeGateway([])
+    tools = AnalysisTools(fake)
+
+    result = await tools.refine_incident_span({}, "throughput", _WINDOW_START, _WINDOW_END)
+
+    assert result["error_type"] == "invalid_input"
+    assert fake.queries == []
+
+
+async def test_refine_incident_span_window_end_before_start_is_invalid_input():
+    fake = _FakeGateway([])
+    tools = AnalysisTools(fake)
+
+    result = await tools.refine_incident_span({}, "rebuffer", _WINDOW_END, _WINDOW_START)
+
+    assert result["error_type"] == "invalid_input"
+    assert fake.queries == []
+
+
+async def test_refine_incident_span_reports_infrastructure_failure():
+    tools = AnalysisTools(_FakeGateway([QueryError("connection reset")]))
+
+    result = await tools.refine_incident_span({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert result["error_type"] == "infrastructure_failure"
+
+
+# ---------------------------------------------------------------------------
 # ADK wiring: FunctionTool construction is static (no model call) and the
 # gateway never leaks into the schema the model would see.
 # ---------------------------------------------------------------------------
 
 
-def test_build_function_tools_returns_five_tools_named_after_the_primitives():
+def test_build_function_tools_returns_seven_tools_named_after_the_primitives():
     fake = _FakeGateway([])
     tools = build_function_tools(fake)
 
@@ -411,6 +582,8 @@ def test_build_function_tools_returns_five_tools_named_after_the_primitives():
         "detect_anomalies",
         "measure_slice",
         "split_on_dimension",
+        "split_all_dimensions",
+        "refine_incident_span",
         "find_changes",
         "quantify_impact",
     }
@@ -479,3 +652,69 @@ async def test_split_on_dimension_finds_roku_with_lift_above_threshold_for_the_r
         f"descend -- got {top['lift']!r}"
     )
     assert result["sql"] and result["baseline_sql"]
+
+
+@pytest.mark.integration
+async def test_split_all_dimensions_finds_the_real_incidents_top_dimension_in_one_call(gateway):
+    """DEFECT 3: one call must surface the same signal 8 separate split_on_dimension
+    calls were needed for before."""
+    window_start, window_end = _roku_820_window()
+    tools = AnalysisTools(gateway)
+
+    result = await tools.split_all_dimensions({}, "rebuffer", window_start, window_end)
+
+    assert "error" not in result, result
+    top = result["dimensions"][0]
+    assert top["dimension"] in ("device_type", "app_version"), (
+        f"expected device_type or app_version to rank first by lift, got "
+        f"{[(d['dimension'], d['lift']) for d in result['dimensions']]}"
+    )
+    assert top["lift"] is not None and top["lift"] > 1.5
+    assert result["sql"] and result["baseline_sql"]
+
+
+@pytest.mark.integration
+async def test_refine_incident_span_recovers_a_multi_hour_span_from_a_narrow_fragment(gateway):
+    """DEFECT 1: handed only a 30-minute fragment of the real ~8-hour incident (what a
+    diluted population-level detector would see at its worst peak), refining directly
+    on the isolated slice must recover something close to the true span, not just
+    re-confirm the fragment it was handed."""
+    window_start_str, _window_end_str = _roku_820_window()
+    fragment_start = datetime.fromisoformat(window_start_str)
+    fragment_end = (fragment_start + timedelta(minutes=30)).isoformat()
+    tools = AnalysisTools(gateway)
+
+    result = await tools.refine_incident_span(
+        {"device_type": "roku", "app_version": "8.2.0"}, "rebuffer", window_start_str, fragment_end
+    )
+
+    assert "error" not in result, result
+    assert result["refined"] is True, result
+    refined_start = datetime.fromisoformat(result["start"])
+    refined_end = datetime.fromisoformat(result["end"])
+    refined_hours = (refined_end - refined_start).total_seconds() / 3600
+    assert refined_hours > 2, (
+        f"expected refinement to recover a multi-hour span from a 30-minute fragment, "
+        f"got {refined_hours:.2f}h ({result['start']} to {result['end']})"
+    )
+    assert result["buckets_breached"] > 0
+    assert result["typical_severity_ratio"] is not None
+    assert result["peak_severity_ratio"] is not None
+    assert result["severity_sql"]
+
+
+@pytest.mark.integration
+async def test_quantify_impact_measures_its_own_severity_for_the_real_incident(gateway):
+    """DEFECT 2: quantify_impact takes no severity parameter -- it must measure a
+    positive severity ratio itself from the real incident's slice and window."""
+    window_start, window_end = _roku_820_window()
+    tools = AnalysisTools(gateway)
+
+    result = await tools.quantify_impact(
+        {"device_type": "roku", "app_version": "8.2.0"}, "rebuffer", window_start, window_end
+    )
+
+    assert "error" not in result, result
+    assert result["typical_severity_ratio"] is not None and result["typical_severity_ratio"] > 0
+    assert result["affected_subscribers"] > 0
+    assert result["severity_sql"] and result["detect_sql"] and result["sql"]

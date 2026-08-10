@@ -16,7 +16,7 @@ than merely a discouraged one, it does:
   disconfirming evidence ``find_changes`` returned fails Pydantic validation
   at the ADK layer instead of silently passing through as a confident,
   unexamined answer.
-* ``ClaimReference`` restricts ``tool_name`` to the five known analysis
+* ``ClaimReference`` restricts ``tool_name`` to the seven known analysis
   primitives (``Literal``, not ``str``) -- a claim cannot cite a tool that
   does not exist, and every ``BriefClaim`` requires one.
 * ``ActProposal.requires_human_approval`` and ``.executed`` are ``Literal``
@@ -36,13 +36,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-# The five analysis primitives from ``continuity/agent/tools.py``, and nothing
+# The seven analysis primitives from ``continuity/agent/tools.py``, and nothing
 # else -- a ``ClaimReference`` citing anything outside this set fails Pydantic
 # validation before an eval harness ever has to check it.
 ToolName = Literal[
     "detect_anomalies",
     "measure_slice",
     "split_on_dimension",
+    "split_all_dimensions",
+    "refine_incident_span",
     "find_changes",
     "quantify_impact",
 ]
@@ -72,7 +74,7 @@ class SliceDimension(BaseModel):
 class ClaimReference(BaseModel):
     """Points a figure at the exact tool call that produced it.
 
-    ``tool_name`` is restricted to the five known primitives -- citing a tool
+    ``tool_name`` is restricted to the seven known primitives -- citing a tool
     that does not exist is a validation error, not a plausible-looking typo.
     ``audit_index`` must match an entry actually recorded in this
     investigation's audit log (`continuity.agent.agents.AuditLog`); the

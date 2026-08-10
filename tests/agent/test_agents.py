@@ -361,6 +361,27 @@ async def split_on_dimension(slice_json, metric, dimension, window_start, window
     return {"sql": "SELECT split", "values": [{"value": "roku", "lift": 4.4}], "informative": True}
 
 
+async def split_all_dimensions(slice_json, metric, window_start, window_end):
+    return {
+        "sql": "SELECT split_all",
+        "dimensions": [
+            {"dimension": "device_type", "top_value": "roku", "lift": 4.4, "informative": True}
+        ],
+    }
+
+
+async def refine_incident_span(slice_json, metric, approx_start, approx_end):
+    return {
+        "sql": "SELECT refine",
+        "refined": True,
+        "start": "2026-02-12 12:00:00",
+        "end": "2026-02-12 13:00:00",
+        "buckets_breached": 6,
+        "typical_severity_ratio": 2.1,
+        "peak_severity_ratio": 3.4,
+    }
+
+
 async def find_changes(slice_json, onset):
     return {
         "sql": "SELECT changes",
@@ -369,9 +390,10 @@ async def find_changes(slice_json, onset):
     }
 
 
-async def quantify_impact(slice_json, window_start, window_end, severity_ratio):
+async def quantify_impact(slice_json, metric, window_start, window_end):
     return {
         "sql": "SELECT quantify",
+        "typical_severity_ratio": 2.1,
         "affected_subscribers": 1000,
         "arr_at_risk_low": "1.00",
         "arr_at_risk_expected": "2.00",
@@ -379,6 +401,10 @@ async def quantify_impact(slice_json, window_start, window_end, severity_ratio):
         "methodology": {"notes": "assumption-based"},
     }
 
+
+# Tool call order the scripted INVESTIGATE model below drives: split_all_dimensions (0)
+# -> refine_incident_span (1); then CORRELATE's find_changes (2); then QUANTIFY's
+# quantify_impact (3). Every `source.audit_index` below must match this exactly.
 
 _INVESTIGATION_JSON = json.dumps(
     {
@@ -389,8 +415,8 @@ _INVESTIGATION_JSON = json.dumps(
         "window_end": "2026-02-12 13:00:00",
         "final_lift": 4.4,
         "stop_reason": "evidence_sufficient",
-        "reasoning": "roku showed lift 4.4x, confirmed by measure_slice",
-        "source": {"tool_name": "split_on_dimension", "audit_index": 0},
+        "reasoning": "roku showed lift 4.4x, confirmed and refined by refine_incident_span",
+        "source": {"tool_name": "refine_incident_span", "audit_index": 1},
     }
 )
 
@@ -408,7 +434,7 @@ _CORRELATION_JSON = json.dumps(
         "confidence": "high",
         "top_candidate_change_id": "chg-1",
         "reasoning": "temporal and dimensional match, corroborated by disconfirming evidence",
-        "source": {"tool_name": "find_changes", "audit_index": 1},
+        "source": {"tool_name": "find_changes", "audit_index": 2},
     }
 )
 
@@ -419,7 +445,7 @@ _QUANTIFY_JSON = json.dumps(
         "arr_at_risk_expected": "2.00",
         "arr_at_risk_high": "3.00",
         "methodology_caveat": "coefficients are documented assumptions, not measured",
-        "source": {"tool_name": "quantify_impact", "audit_index": 2},
+        "source": {"tool_name": "quantify_impact", "audit_index": 3},
     }
 )
 
@@ -429,15 +455,15 @@ _BRIEF_JSON = json.dumps(
         "claims": [
             {
                 "text": "roku device_type is the blast radius",
-                "source": {"tool_name": "split_on_dimension", "audit_index": 0},
+                "source": {"tool_name": "split_all_dimensions", "audit_index": 0},
             },
             {
                 "text": "chg-1 is the probable cause",
-                "source": {"tool_name": "find_changes", "audit_index": 1},
+                "source": {"tool_name": "find_changes", "audit_index": 2},
             },
             {
                 "text": "1000 subscribers affected, $2.00 ARR at risk",
-                "source": {"tool_name": "quantify_impact", "audit_index": 2},
+                "source": {"tool_name": "quantify_impact", "audit_index": 3},
             },
         ],
         "recommended_action": "roll back chg-1",
@@ -456,13 +482,23 @@ def _build_scripted_pipeline() -> tuple[Workflow, AuditLog, dict[str, FakeLlm]]:
         responses=[
             scripted_function_calls(
                 (
-                    "split_on_dimension",
+                    "split_all_dimensions",
                     {
                         "slice_json": {},
                         "metric": "rebuffer",
-                        "dimension": "device_type",
                         "window_start": "2026-02-12 12:00:00",
                         "window_end": "2026-02-12 13:00:00",
+                    },
+                )
+            ),
+            scripted_function_calls(
+                (
+                    "refine_incident_span",
+                    {
+                        "slice_json": {"device_type": "roku"},
+                        "metric": "rebuffer",
+                        "approx_start": "2026-02-12 12:00:00",
+                        "approx_end": "2026-02-12 13:00:00",
                     },
                 )
             ),
@@ -474,6 +510,8 @@ def _build_scripted_pipeline() -> tuple[Workflow, AuditLog, dict[str, FakeLlm]]:
             FunctionTool(detect_anomalies),
             FunctionTool(measure_slice),
             FunctionTool(split_on_dimension),
+            FunctionTool(split_all_dimensions),
+            FunctionTool(refine_incident_span),
         ],
         model=investigate_model,
         audit_log=audit_log,
@@ -503,9 +541,9 @@ def _build_scripted_pipeline() -> tuple[Workflow, AuditLog, dict[str, FakeLlm]]:
                     "quantify_impact",
                     {
                         "slice_json": {"device_type": "roku"},
+                        "metric": "rebuffer",
                         "window_start": "2026-02-12 12:00:00",
                         "window_end": "2026-02-12 13:00:00",
-                        "severity_ratio": 3.4,
                     },
                 )
             ),
@@ -571,13 +609,17 @@ async def test_audit_log_captures_tool_name_arguments_and_sql_in_call_order():
     await _run_pipeline(pipeline)
 
     assert [e.tool_name for e in audit_log.entries] == [
-        "split_on_dimension",
+        "split_all_dimensions",
+        "refine_incident_span",
         "find_changes",
         "quantify_impact",
     ]
     split_call = audit_log.entries[0]
-    assert split_call.arguments["dimension"] == "device_type"
-    assert split_call.sql == "SELECT split"
+    assert split_call.arguments["metric"] == "rebuffer"
+    assert split_call.sql == "SELECT split_all"
+    refine_call = audit_log.entries[1]
+    assert refine_call.arguments["approx_start"] == "2026-02-12 12:00:00"
+    assert refine_call.sql == "SELECT refine"
 
 
 async def test_correlate_stage_sees_the_investigation_result_via_state_templating():

@@ -25,7 +25,7 @@ either inventing a node that duplicates logic that already lives in ``tools.py``
 which is not what CORRELATE/QUANTIFY/BRIEF do.
 
 Every stage's tools come from ``continuity.agent.tools.build_function_tools`` (the
-five analysis primitives) -- this module only decides which of those five tools go to
+seven analysis primitives) -- this module only decides which of those seven tools go to
 which stage, never adds new ones and never adds a write capability. INVESTIGATE
 additionally gets a construction-only, read-only ``McpToolset`` escape hatch (see
 ``build_readonly_mcp_toolset``); nothing in this module ever calls it.
@@ -152,15 +152,23 @@ class AuditLog:
 # INVESTIGATE
 # ---------------------------------------------------------------------------
 
-INVESTIGATE_TOOL_NAMES = ("detect_anomalies", "measure_slice", "split_on_dimension")
+INVESTIGATE_TOOL_NAMES = (
+    "detect_anomalies",
+    "measure_slice",
+    "split_on_dimension",
+    "split_all_dimensions",
+    "refine_incident_span",
+)
 
 INVESTIGATE_INSTRUCTION = """\
 You are investigating a suspected quality-of-experience incident on a streaming video
 platform. A population-level anomaly has already been detected; your job is to find
 WHERE it is concentrated -- the smallest sub-population (the "blast radius") whose own
-deviation explains it -- using only the tools below. You must never invent a number:
-every figure in your final answer must come from a tool call you actually made in this
-investigation.
+deviation explains it, and WHEN it truly started and ended -- using only the tools
+below. You must never invent a number: every figure in your final answer must come
+from a tool call you actually made in this investigation. There is no severity number
+for you to supply anywhere in this pipeline -- quantify_impact (a later stage) measures
+severity itself; your job here is only to localize the slice and its true span.
 
 Your tools:
 - detect_anomalies: confirms WHEN and how severely a slice deviated from its own
@@ -170,21 +178,34 @@ Your tools:
 - measure_slice: one clean baseline comparison (value, baseline, z) for a specific
   slice and window. Use it to confirm a candidate's own deviation before, or after,
   you commit to it.
-- split_on_dimension: breaks a slice down by one dimension (device_type, app_version,
-  os_version, cdn, pop, isp, country, region, title_id) and ranks each value by
-  contribution AND lift. LIFT IS THE SIGNAL TO ACT ON, not raw share or raw
-  contribution: lift around 1.0 means a value is just a big population segment, not a
-  cause; lift meaningfully above 1.0 (roughly above 1.5) means that value is genuinely
-  worse than its size predicts and is worth descending into. Lift below 1.0, or null,
-  means do not chase that value no matter how large its share looks.
+- split_all_dimensions: breaks your current slice down by EVERY candidate dimension not
+  already pinned, in ONE call, ranked by lift. CALL THIS FIRST at every level of
+  descent, before reaching for split_on_dimension -- it replaces what would otherwise
+  be several separate single-dimension calls for the same information.
+- split_on_dimension: breaks a slice down by ONE dimension you already suspect and
+  ranks each value by contribution AND lift. Only use this for a closer look at a
+  single dimension (e.g. more values than split_all_dimensions' top-one, or to re-check
+  a dimension after refining further) -- LIFT IS THE SIGNAL TO ACT ON either way, not
+  raw share or raw contribution: lift around 1.0 means a value is just a big population
+  segment, not a cause; lift meaningfully above 1.0 (roughly above 1.5) means that value
+  is genuinely worse than its size predicts and is worth descending into. Lift below
+  1.0, or null, means do not chase that value no matter how large its share looks.
+- refine_incident_span: once you have localized a slice, re-detects directly on it
+  (never the whole population) to find its TRUE onset/end -- population-level
+  detection dilutes a narrowly-scoped fault and understates both its span and its
+  severity. Call this AFTER localizing and BEFORE finalizing your answer; it also
+  reports (for your own context, not for you to pass anywhere) the typical and peak
+  severity it measured on the refined span.
 
 Procedure:
 1. Form a hypothesis about which dimension might explain the deviation.
-2. Call split_on_dimension for that dimension on your current slice (start from the
-   whole population, i.e. an empty slice).
-3. Read the lift of the top value. If it is meaningfully above 1.0, refine your slice
-   to pin that value and repeat from step 1 with a DIFFERENT dimension -- a dimension
-   already pinned in your slice cannot be split again.
+2. Call split_all_dimensions on your current slice (start from the whole population,
+   i.e. an empty slice) to see every candidate dimension's top value and lift in one
+   call.
+3. Read the lift of the best-ranked dimension's top value. If it is meaningfully above
+   1.0, refine your slice to pin that value and repeat from step 2 -- split_all_dimensions
+   automatically excludes any dimension already pinned. Use split_on_dimension only if
+   you need a closer look at one dimension.
 4. Stop descending as soon as any of these holds, and record which one as
    stop_reason:
    - low_lift: the best remaining candidate's lift is not meaningfully above 1.0.
@@ -196,15 +217,21 @@ Procedure:
      keep the investigation bounded.
    - evidence_sufficient: one more level of splitting no longer meaningfully raises
      lift over your current slice -- the evidence has stopped improving.
-5. Before finalizing, call measure_slice or detect_anomalies on your final slice to
-   confirm its own deviation is real -- do not stop on a split_on_dimension result
-   alone without this confirmation, and cite that confirming call as `source`.
+5. Call refine_incident_span on your final slice with the population-level window you
+   started from. Use its refined `start`/`end` as YOUR final window_start/window_end
+   (unless it reports `refined: false`, in which case your original window stands --
+   refinement never gives you something worse than what you had).
+6. Before finalizing, call measure_slice or detect_anomalies on your final slice AND
+   its refined window to confirm the deviation is real there -- do not stop on a
+   split_on_dimension/split_all_dimensions result alone without this confirmation, and
+   cite that confirming call as `source`.
 
 Report the final slice as exact dimension/value pairs (empty if no split ever showed
-meaningful lift), the metric and window you investigated, the lift you read at the
-point you stopped (null if final_slice is empty), your stop_reason, your reasoning,
-and the `source` tool call that confirmed the final slice. Every tool result you
-receive carries its own audit_index -- copy it exactly into `source`, never guess.
+meaningful lift), the metric and the REFINED window from step 5 (not your original
+detection window) you investigated, the lift you read at the point you stopped (null if
+final_slice is empty), your stop_reason, your reasoning, and the `source` tool call
+that confirmed the final slice. Every tool result you receive carries its own
+audit_index -- copy it exactly into `source`, never guess.
 """
 
 
@@ -216,16 +243,16 @@ def build_investigate_agent(
     mcp_toolset: McpToolset | None = None,
     name: str = "investigate",
 ) -> LlmAgent:
-    """The core stage: forms a hypothesis, splits on a dimension, reads lift, and
-    decides whether to descend -- see the module docstring for how `model`
-    substitution and the audit log work.
+    """The core stage: forms a hypothesis, splits on a dimension, reads lift, refines
+    the incident's true span, and decides whether to descend further -- see the module
+    docstring for how `model` substitution and the audit log work.
 
-    `tools` must be exactly the three tools named in `INVESTIGATE_TOOL_NAMES`
-    (`detect_anomalies`, `measure_slice`, `split_on_dimension`) -- `find_changes` and
-    `quantify_impact` belong to later stages and are never handed to INVESTIGATE.
-    `mcp_toolset`, when given, is the read-only raw-SQL escape hatch (construction
-    only; this function never calls it) for when the three primitives above do not
-    anticipate something.
+    `tools` must be exactly the tools named in `INVESTIGATE_TOOL_NAMES`
+    (`detect_anomalies`, `measure_slice`, `split_on_dimension`, `split_all_dimensions`,
+    `refine_incident_span`) -- `find_changes` and `quantify_impact` belong to later
+    stages and are never handed to INVESTIGATE. `mcp_toolset`, when given, is the
+    read-only raw-SQL escape hatch (construction only; this function never calls it)
+    for when the primitives above do not anticipate something.
     """
     agent_tools: list[Any] = list(tools)
     if mcp_toolset is not None:
@@ -308,12 +335,13 @@ def build_correlate_agent(
 QUANTIFY_TOOL_NAMES = ("quantify_impact",)
 
 QUANTIFY_INSTRUCTION = """\
-The blast radius, its window, and the severity of its deviation are already known
-from the investigation below. Call quantify_impact once with that slice, window, and
-a severity_ratio derived from the investigation's own measured deviation (never a
-number you invent). Do not compute or estimate any figure yourself --
-affected_subscribers and the ARR-at-risk band in your answer must equal exactly what
-the tool returned.
+The blast radius and its true window are already known from the investigation below.
+Call quantify_impact once with that slice, its metric, and that window --
+quantify_impact takes NO severity parameter; it measures severity itself, directly from
+the slice and window (the median deviation, exactly like the investigation's own
+refine_incident_span step), so there is nothing for you to compute or supply there. Do
+not compute or estimate any figure yourself -- affected_subscribers and the ARR-at-risk
+band in your answer must equal exactly what the tool returned.
 
 The investigation so far:
 {investigation_result}
@@ -423,8 +451,8 @@ def build_investigation_pipeline(
     graph (`START -> investigate -> correlate -> quantify -> brief`), sharing one
     `AuditLog` across all of them.
 
-    `tools` is the five-tool list `continuity.agent.tools.build_function_tools(gateway)`
-    returns; this function only decides which of those five go to which stage
+    `tools` is the seven-tool list `continuity.agent.tools.build_function_tools(gateway)`
+    returns; this function only decides which of those seven go to which stage
     (`select_tools`), it never constructs `AnalysisTools` itself -- callers own the
     `ClickHouseMCPGateway` binding (production wiring in sub-project 4; a placeholder
     gateway in tests, since binding a gateway never calls it). ACT is deliberately NOT
