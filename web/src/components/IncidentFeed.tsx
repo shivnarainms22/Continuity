@@ -62,68 +62,77 @@ export function IncidentFeed({ onSelect }: { onSelect: (incident: IncidentSummar
     : null
 
   return (
-    <div className="mx-auto max-w-3xl px-6 py-10">
-      <header className="mb-10">
-        <h1 className="text-lg font-semibold text-fg">Continuity</h1>
-        <p className="mt-1 text-sm text-muted">
-          Streaming QoE incident investigation. Deterministic detection, no model calls, every number
-          traceable to the query that produced it.
-        </p>
-      </header>
+    <div className="flex min-h-screen flex-col">
+      <div className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
+        <header className="mb-10">
+          <h1 className="text-lg font-semibold text-fg">Continuity</h1>
+          <p className="mt-1 max-w-2xl text-sm text-muted">
+            Streaming QoE incident investigation. Deterministic detection, no model calls, every number
+            traceable to the query that produced it.
+          </p>
+        </header>
 
-      <h2 className="mb-3 text-xs font-semibold tracking-wide text-faint uppercase">
-        Incidents{incidents ? ` (${incidents.length})` : ''}
-      </h2>
+        <h2 className="mb-3 text-xs font-semibold tracking-wide text-faint uppercase">
+          Incidents{incidents ? ` (${incidents.length})` : ''}
+        </h2>
 
-      {loadError && (
-        <div className="rounded border border-danger-dim bg-danger-dim/40 p-3 text-sm text-danger">
-          Failed to load incidents: {loadError}
-        </div>
-      )}
+        {loadError && (
+          <div className="rounded border border-danger-dim bg-danger-dim/40 p-3 text-sm text-danger">
+            Failed to load incidents: {loadError}
+          </div>
+        )}
 
-      {!incidents && !loadError && (
-        <div className="space-y-2">
-          {[0, 1, 2].map((i) => (
-            <div key={i} className="h-24 animate-pulse rounded border border-hairline bg-surface" />
-          ))}
-        </div>
-      )}
+        {!incidents && !loadError && (
+          <div className="space-y-2">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="h-24 animate-pulse rounded border border-hairline bg-surface" />
+            ))}
+          </div>
+        )}
 
-      <ul className="space-y-2">
-        {sorted?.map((incident) => (
-          <li key={incident.id}>
-            <button
-              type="button"
-              onClick={() => onSelect(incident)}
-              className="group flex w-full items-center justify-between gap-6 rounded border border-hairline bg-surface p-4 text-left transition-colors hover:border-hairline-strong hover:bg-surface-2"
-            >
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-fg">{humanizeKind(incident.kind)}</span>
-                  {incident.is_decoy && (
-                    <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-faint uppercase">
-                      decoy — no fault
-                    </span>
-                  )}
+        <ul className="space-y-2">
+          {sorted?.map((incident) => (
+            <li key={incident.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(incident)}
+                className="group flex w-full items-center justify-between gap-6 rounded border border-hairline bg-surface p-4 text-left transition-colors hover:border-hairline-strong hover:bg-surface-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-fg">{humanizeKind(incident.kind)}</span>
+                    {incident.is_decoy && (
+                      <span className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-faint uppercase">
+                        decoy — no fault
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 truncate text-sm text-muted">
+                    {humanizeBlastRadiusRecord(incident.predicate)}
+                  </p>
+                  <p className="mt-1 font-mono text-[11px] text-faint">
+                    {formatDateRange(incident.window.start, incident.window.end)} ·{' '}
+                    {formatDuration(incident.window.start, incident.window.end)} · {incident.id}
+                  </p>
                 </div>
-                <p className="mt-1 truncate text-sm text-muted">
-                  {humanizeBlastRadiusRecord(incident.predicate)}
-                </p>
-                <p className="mt-1 font-mono text-[11px] text-faint">
-                  {formatDateRange(incident.window.start, incident.window.end)} ·{' '}
-                  {formatDuration(incident.window.start, incident.window.end)} · {incident.id}
-                </p>
-              </div>
-              <div className="shrink-0 text-right">
-                <MoneyAtRisk state={severities[incident.id]} />
-              </div>
-              <span className="shrink-0 text-sm font-medium text-faint transition-colors group-hover:text-accent">
-                Investigate →
-              </span>
-            </button>
-          </li>
-        ))}
-      </ul>
+                <div className="shrink-0 text-right">
+                  <MoneyAtRisk state={severities[incident.id]} />
+                </div>
+                <span className="shrink-0 text-sm font-medium text-faint transition-colors group-hover:text-accent">
+                  Investigate →
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <footer className="border-t border-hairline">
+        <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-2 px-6 py-4 text-[11px] text-faint">
+          <span>63.85M playback events synthesized over 56 days</span>
+          <span>Every figure above traces back to the SQL query that produced it</span>
+        </div>
+      </footer>
     </div>
   )
 }

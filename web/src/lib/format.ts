@@ -108,6 +108,19 @@ export function formatMultiple(value: number): string {
   return `${value.toFixed(1)}x`
 }
 
+// Every naive ISO-8601 timestamp in this dataset is UTC by this project's own
+// convention (see continuity/config.py) -- the backend never appends an offset.
+// `new Date("2026-02-12T18:10:00")` parses a naive string as the *browser's local
+// time*, not UTC, so every downstream render silently shifts by the host's UTC
+// offset (this bit the data loader once already; see CLAUDE.md). `parseUtc` is the
+// ONE place a naive-UTC string becomes a `Date` -- every component and every helper
+// below routes through it instead of calling `new Date(...)` directly.
+const HAS_TZ_OFFSET = /(Z|[+-]\d{2}:?\d{2})$/
+
+export function parseUtc(iso: string): Date {
+  return new Date(HAS_TZ_OFFSET.test(iso) ? iso : `${iso}Z`)
+}
+
 const dateTimeFormatter = new Intl.DateTimeFormat('en-US', {
   month: 'short',
   day: 'numeric',
@@ -121,7 +134,7 @@ const dateTimeFormatter = new Intl.DateTimeFormat('en-US', {
  * pinned to the UTC timeZone above so this never silently shifts by the browser's own
  * local offset. */
 export function formatDateTime(iso: string): string {
-  return `${dateTimeFormatter.format(new Date(iso))} UTC`
+  return `${dateTimeFormatter.format(parseUtc(iso))} UTC`
 }
 
 const timeOnlyFormatter = new Intl.DateTimeFormat('en-US', {
@@ -133,8 +146,8 @@ const timeOnlyFormatter = new Intl.DateTimeFormat('en-US', {
 /** Full "Feb 13, 2026, 3:40 AM – 9:05 AM UTC" when both ends fall on the same UTC
  * calendar day; the date is repeated only when the range actually spans days. */
 export function formatDateRange(startIso: string, endIso: string): string {
-  const start = new Date(startIso)
-  const end = new Date(endIso)
+  const start = parseUtc(startIso)
+  const end = parseUtc(endIso)
   const sameDay =
     start.getUTCFullYear() === end.getUTCFullYear() &&
     start.getUTCMonth() === end.getUTCMonth() &&
@@ -146,7 +159,7 @@ export function formatDateRange(startIso: string, endIso: string): string {
 }
 
 export function formatDuration(startIso: string, endIso: string): string {
-  const ms = new Date(endIso).getTime() - new Date(startIso).getTime()
+  const ms = parseUtc(endIso).getTime() - parseUtc(startIso).getTime()
   const hours = ms / (1000 * 60 * 60)
   if (hours < 1) return `${Math.round(ms / (1000 * 60))}m`
   if (hours < 48) return `${hours % 1 === 0 ? hours : hours.toFixed(1)}h`
@@ -174,5 +187,5 @@ export function formatTime(iso: string): string {
     minute: '2-digit',
     second: '2-digit',
     timeZone: 'UTC',
-  }).format(new Date(iso))
+  }).format(parseUtc(iso))
 }
