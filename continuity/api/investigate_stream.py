@@ -46,6 +46,12 @@ from continuity.analysis.impact import compute_impact
 from continuity.analysis.slices import Slice
 from continuity.analysis.walk import WalkResult
 from continuity.analysis.walk import walk as run_walk
+from continuity.api.report_schema import (
+    fetch_incident_series,
+    iso,
+    serialize_report,
+    slice_predicates,
+)
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
 
 router = APIRouter(prefix="/api/investigate")
@@ -101,6 +107,10 @@ async def stream_investigation(
             "total_buckets": detection.total_buckets,
             "anomalous_buckets": detection.anomalous_buckets,
             "windows_found": len(detection.windows),
+            "windows": [
+                {"start": iso(w.start), "end": iso(w.end), "peak_z": w.peak_z}
+                for w in detection.windows
+            ],
         },
     )
 
@@ -117,7 +127,20 @@ async def stream_investigation(
     )
     incidents = merge_windows_into_incidents(entries, merge_gap=DEFAULT_MERGE_GAP)
     yield _stage_event(
-        walk_timing, {"anomaly_windows": len(entries), "incidents_after_merge": len(incidents)}
+        walk_timing,
+        {
+            "anomaly_windows": len(entries),
+            "incidents_after_merge": len(incidents),
+            "walks": [
+                {
+                    "start": iso(anomaly.start),
+                    "end": iso(anomaly.end),
+                    "blast_radius": slice_predicates(walk_result.final_slice),
+                    "stop_reason": walk_result.stop_reason.value,
+                }
+                for anomaly, walk_result in entries
+            ],
+        },
     )
 
     idx = len(gateway.query_log)
@@ -131,11 +154,25 @@ async def stream_investigation(
     refine_timing = StageTiming(
         "refine", (time.perf_counter() - stage_started) * 1000, tuple(gateway.query_log[idx:])
     )
-    yield _stage_event(refine_timing, {"incidents_refined": len(refined_incidents)})
+    yield _stage_event(
+        refine_timing,
+        {
+            "incidents_refined": len(refined_incidents),
+            "refined": [
+                {
+                    "used_fallback": r.used_fallback,
+                    "span": {"start": iso(r.span[0]), "end": iso(r.span[1])},
+                    "typical_multiple": float(r.typical_deviation_ratio) + 1.0,
+                }
+                for r in refined_incidents
+            ],
+        },
+    )
 
     idx = len(gateway.query_log)
     stage_started = time.perf_counter()
     incident_results: list[IncidentInvestigation] = []
+    incident_series: list[dict] = []
     for refined in refined_incidents:
         correlation = await correlate_changes(
             gateway,
@@ -149,6 +186,10 @@ async def stream_investigation(
             window=refined.span,
             qoe_delta_ratio=refined.typical_deviation_ratio,
         )
+        series = await fetch_incident_series(
+            gateway, slice_=refined.final_slice, metric_name=metric_name, span=refined.span
+        )
+        incident_series.append(series)
         incident_results.append(
             IncidentInvestigation(
                 incident=refined,
@@ -162,11 +203,25 @@ async def stream_investigation(
         (time.perf_counter() - stage_started) * 1000,
         tuple(gateway.query_log[idx:]),
     )
-    top_causes = [
-        ir.correlation.candidates[0].description if ir.correlation.candidates else "none identified"
-        for ir in incident_results
-    ]
-    yield _stage_event(cq_timing, {"incidents": len(incident_results), "top_causes": top_causes})
+    yield _stage_event(
+        cq_timing,
+        {
+            "incidents": len(incident_results),
+            "detail": [
+                {
+                    "blast_radius": slice_predicates(ir.incident.final_slice),
+                    "top_cause": (
+                        ir.correlation.candidates[0].description
+                        if ir.correlation.candidates
+                        else None
+                    ),
+                    "affected_subscribers": ir.impact.affected_subscribers,
+                    "arr_at_risk_expected": float(ir.impact.arr_at_risk_expected),
+                }
+                for ir in incident_results
+            ],
+        },
+    )
 
     total_elapsed_ms = (time.perf_counter() - total_started) * 1000
     report = InvestigationReport(
@@ -179,7 +234,15 @@ async def stream_investigation(
         total_elapsed_ms=total_elapsed_ms,
     )
     brief = render_brief(report, show_sql=False)
-    yield _sse("done", {"total_elapsed_ms": round(total_elapsed_ms, 1), "brief": brief})
+    structured_report = serialize_report(report, incident_series)
+    yield _sse(
+        "done",
+        {
+            "total_elapsed_ms": round(total_elapsed_ms, 1),
+            "brief": brief,
+            "report": structured_report,
+        },
+    )
 
 
 @router.get("/{incident_id}/stream")

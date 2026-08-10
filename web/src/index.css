@@ -1,1 +1,59 @@
 @import 'tailwindcss';
+
+/* Design tokens -- see docs/screenshots and the task report for the reasoning.
+   Near-black background (not pure #000), one accent (amber) reserved for state that
+   genuinely matters, hairline borders instead of shadows, no gradients. */
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  --color-bg: #0a0b0d;
+  --color-surface: #111318;
+  --color-surface-2: #171a21;
+  --color-hairline: #23262e;
+  --color-hairline-strong: #2f333c;
+
+  --color-fg: #e7e9ec;
+  --color-muted: #9aa1ab;
+  --color-faint: #5b6270;
+
+  /* The one accent: a considered, desaturated amber -- reserved for running/pending
+     state, the anomaly on the hero chart, and primary calls to action. Never used
+     for ordinary emphasis. */
+  --color-accent: #e3a13d;
+  --color-accent-fg: #1a1206;
+  --color-accent-dim: #3a2d16;
+
+  /* Semantic colour, used sparingly and only where meaning demands it. */
+  --color-danger: #d4695f;
+  --color-danger-dim: #3a2320;
+  --color-success: #5fae7c;
+  --color-success-dim: #1c2c22;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans antialiased;
+  }
+
+  ::selection {
+    background: var(--color-accent-dim);
+    color: var(--color-fg);
+  }
+
+  summary {
+    list-style: none;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}

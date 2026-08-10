@@ -30,10 +30,11 @@ class GroundTruthError(RuntimeError):
 
 
 def load_incident_summaries(path: Path = DEFAULT_GROUND_TRUTH_PATH) -> list[dict[str, Any]]:
-    """The incident feed `/api/incidents` returns: id, window, predicate, decoy flag.
+    """The incident feed `/api/incidents` returns: id, window, predicate, kind, decoy flag.
 
-    Ground truth's `predicate` (the blast-radius dimensions) is exposed here for the UI
-    to display -- unlike the deterministic pipeline's own `walk()`, which must never be
+    Ground truth's `predicate` (the blast-radius dimensions) and `kind` (a short,
+    human incident category, e.g. "device_app_fault") are exposed here for the UI to
+    display -- unlike the deterministic pipeline's own `walk()`, which must never be
     given the predicate as a shortcut. This endpoint only lists incidents; it does not
     run or bias the investigation.
     """
@@ -53,6 +54,7 @@ def load_incident_summaries(path: Path = DEFAULT_GROUND_TRUTH_PATH) -> list[dict
             "id": row["incident_id"],
             "window": {"start": row["start"], "end": row["end"]},
             "predicate": row.get("predicate", {}),
+            "kind": row.get("kind"),
             "is_decoy": bool(row.get("is_decoy", False)),
         }
         for row in incidents

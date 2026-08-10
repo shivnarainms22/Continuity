@@ -12,6 +12,7 @@ _SAMPLE = {
     "incidents": [
         {
             "incident_id": "INC-TEST-1",
+            "kind": "device_app_fault",
             "start": "2026-03-01T00:00:00+00:00",
             "end": "2026-03-01T04:00:00+00:00",
             "predicate": {"device_type": "roku"},
@@ -19,6 +20,7 @@ _SAMPLE = {
         },
         {
             "incident_id": "DECOY-TEST-2",
+            "kind": "decoy_premiere",
             "start": "2026-03-05T00:00:00+00:00",
             "end": "2026-03-05T04:00:00+00:00",
             "predicate": {"title_id": "3"},
@@ -28,7 +30,7 @@ _SAMPLE = {
 }
 
 
-def test_returns_id_window_predicate_and_decoy_flag_for_every_incident(tmp_path):
+def test_returns_id_window_predicate_kind_and_decoy_flag_for_every_incident(tmp_path):
     path = tmp_path / "ground_truth.json"
     path.write_text(json.dumps(_SAMPLE), encoding="utf-8")
 
@@ -39,12 +41,14 @@ def test_returns_id_window_predicate_and_decoy_flag_for_every_incident(tmp_path)
             "id": "INC-TEST-1",
             "window": {"start": "2026-03-01T00:00:00+00:00", "end": "2026-03-01T04:00:00+00:00"},
             "predicate": {"device_type": "roku"},
+            "kind": "device_app_fault",
             "is_decoy": False,
         },
         {
             "id": "DECOY-TEST-2",
             "window": {"start": "2026-03-05T00:00:00+00:00", "end": "2026-03-05T04:00:00+00:00"},
             "predicate": {"title_id": "3"},
+            "kind": "decoy_premiere",
             "is_decoy": True,
         },
     ]
@@ -63,6 +67,7 @@ def test_missing_predicate_defaults_to_empty_dict(tmp_path):
 
     assert summaries[0]["predicate"] == {}
     assert summaries[0]["is_decoy"] is False
+    assert summaries[0]["kind"] is None
 
 
 def test_missing_file_raises_ground_truth_error(tmp_path):

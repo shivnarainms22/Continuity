@@ -29,6 +29,7 @@ from continuity.api.ground_truth import (
     GroundTruthError,
     load_incident_summaries,
 )
+from continuity.api.incidents_severity import router as incidents_severity_router
 from continuity.api.investigate_stream import router as investigate_router
 from continuity.config import ClickHouseConfig
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
@@ -83,6 +84,7 @@ async def list_incidents() -> list[dict]:
 
 
 app.include_router(investigate_router)
+app.include_router(incidents_severity_router)
 
 # `check_dir=False`: mounting must not crash the app before `npm run build` has ever
 # run (e.g. in tests, or a fresh checkout) -- a request under a missing directory 404s

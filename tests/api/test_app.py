@@ -33,6 +33,7 @@ def test_incidents_reads_the_configured_ground_truth_file(tmp_path, monkeypatch)
         "incidents": [
             {
                 "incident_id": "INC-FAKE-1",
+                "kind": "pop_fault",
                 "start": "2026-05-01T00:00:00+00:00",
                 "end": "2026-05-01T03:00:00+00:00",
                 "predicate": {"cdn": "cdn_northwind"},
@@ -52,6 +53,7 @@ def test_incidents_reads_the_configured_ground_truth_file(tmp_path, monkeypatch)
             "id": "INC-FAKE-1",
             "window": {"start": "2026-05-01T00:00:00+00:00", "end": "2026-05-01T03:00:00+00:00"},
             "predicate": {"cdn": "cdn_northwind"},
+            "kind": "pop_fault",
             "is_decoy": False,
         }
     ]
