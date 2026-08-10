@@ -521,13 +521,25 @@ async def test_split_all_dimensions_reports_dimensions_with_no_rows_as_no_data()
     assert result["dimensions"][0]["dimension"] == "app_version"
 
 
-async def test_split_all_dimensions_never_includes_title_id():
-    """title_id forces the raw-events table and its numeric value column cannot be
-    batched into the same UNION ALL as the other (string-valued) dimensions --
-    split_on_dimension remains the way to investigate it."""
+async def test_split_all_dimensions_includes_title_id_as_a_candidate():
+    """DEFECT 1: title_id used to be structurally excluded from split_all_dimensions,
+    making the tool blind to per-title faults (INC-ENCODE-1). It must now appear
+    alongside every other candidate dimension, cast to a string so it unions cleanly
+    with the other (string-valued) arms."""
     tools = AnalysisTools(_FakeGateway(_split_all_responses()))
 
     result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert "title_id" in {d["dimension"] for d in result["dimensions"]}
+    assert "toString(title_id)" in result["sql"]
+
+
+async def test_split_all_dimensions_excludes_title_id_once_pinned():
+    tools = AnalysisTools(_FakeGateway(_split_all_responses()))
+
+    result = await tools.split_all_dimensions(
+        {"title_id": "1"}, "rebuffer", _WINDOW_START, _WINDOW_END
+    )
 
     assert "title_id" not in {d["dimension"] for d in result["dimensions"]}
 
@@ -544,7 +556,7 @@ async def test_split_all_dimensions_issues_exactly_one_query_pair_for_every_dime
 
 
 async def test_split_all_dimensions_returns_empty_list_when_every_dimension_is_pinned():
-    slice_json = {d: "x" for d in DIMENSION_HIERARCHY}
+    slice_json = {d: "x" for d in DIMENSION_HIERARCHY} | {"title_id": "1"}
     fake = _FakeGateway([])
     tools = AnalysisTools(fake)
 
@@ -818,6 +830,14 @@ def _roku_820_window() -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _encode_1_window() -> tuple[str, str]:
+    payload = json.loads(_GROUND_TRUTH_PATH.read_text(encoding="utf-8"))
+    incident = next(inc for inc in payload["incidents"] if inc["kind"] == "encode_fault")
+    start = datetime.fromisoformat(incident["start"]).replace(tzinfo=None)
+    end = datetime.fromisoformat(incident["end"]).replace(tzinfo=None)
+    return start.isoformat(), end.isoformat()
+
+
 @pytest.mark.integration
 async def test_split_on_dimension_finds_roku_with_lift_above_threshold_for_the_real_incident(
     gateway,
@@ -858,6 +878,29 @@ async def test_split_all_dimensions_finds_the_real_incidents_top_dimension_in_on
     )
     assert top["lift"] is not None and top["lift"] > 1.5
     assert result["sql"] and result["baseline_sql"]
+
+
+@pytest.mark.integration
+async def test_split_all_dimensions_finds_title_id_for_the_real_encode_fault(gateway):
+    """DEFECT 1: INC-ENCODE-1 is a title-scoped fault (true blast radius
+    {title_id: 1}). Before the fix, split_all_dimensions excluded title_id entirely,
+    leaving the agent structurally blind to it. It must now rank title_id=1 at the
+    top of the batched split for this incident's real window."""
+    window_start, window_end = _encode_1_window()
+    tools = AnalysisTools(gateway)
+
+    result = await tools.split_all_dimensions({}, "bitrate", window_start, window_end)
+
+    assert "error" not in result, result
+    assert result["dimensions"], "expected at least one candidate dimension"
+    top = result["dimensions"][0]
+    assert top["dimension"] == "title_id", (
+        f"expected title_id to rank first by lift/share, got "
+        f"{[(d['dimension'], d['lift'], d['share_of_deviation']) for d in result['dimensions']]}"
+    )
+    assert top["top_value"] == "1"
+    assert top["lift"] is not None and top["lift"] > 1.5
+    assert "toString(title_id)" in result["sql"]
 
 
 @pytest.mark.integration

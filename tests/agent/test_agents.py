@@ -279,6 +279,89 @@ def test_correlation_result_requires_confidence_field():
         CorrelationResult(**payload)
 
 
+def test_correlation_result_requires_corroborated_field():
+    payload = dict(
+        candidates=[], disconfirming_evidence="none returned", confidence="low",
+        reasoning="x", source={"tool_name": "find_changes", "audit_index": 0},
+    )
+
+    with pytest.raises(pydantic.ValidationError, match="corroborated"):
+        CorrelationResult(**payload)
+
+
+def test_correlation_result_rejects_high_confidence_with_zero_candidates():
+    """DEFECT 2: the central fix -- absence of a correlating change is evidence
+    AGAINST the blast radius, so high confidence must be structurally unrepresentable
+    when there is nothing to corroborate with."""
+    payload = dict(
+        candidates=[], disconfirming_evidence="nothing in change_log near onset",
+        confidence="high", corroborated=False, reasoning="x",
+        source={"tool_name": "find_changes", "audit_index": 0},
+    )
+
+    with pytest.raises(pydantic.ValidationError, match="confidence"):
+        CorrelationResult(**payload)
+
+
+def test_correlation_result_rejects_corroborated_true_with_zero_candidates():
+    payload = dict(
+        candidates=[], disconfirming_evidence="nothing in change_log near onset",
+        confidence="low", corroborated=True, reasoning="x",
+        source={"tool_name": "find_changes", "audit_index": 0},
+    )
+
+    with pytest.raises(pydantic.ValidationError, match="corroborated"):
+        CorrelationResult(**payload)
+
+
+def test_correlation_result_rejects_high_confidence_when_not_corroborated_even_with_candidates():
+    payload = dict(
+        candidates=[
+            {
+                "change_id": "chg-9",
+                "rank": 1,
+                "disconfirming_evidence_assessment": "shipped everywhere, everything degraded",
+                "still_plausible": False,
+            }
+        ],
+        disconfirming_evidence="the only candidate is not still_plausible",
+        confidence="high", corroborated=False, reasoning="x",
+        source={"tool_name": "find_changes", "audit_index": 0},
+    )
+
+    with pytest.raises(pydantic.ValidationError, match="confidence"):
+        CorrelationResult(**payload)
+
+
+def test_correlation_result_accepts_low_confidence_with_zero_candidates_and_not_corroborated():
+    """The honest, unresolved answer must remain representable."""
+    payload = dict(
+        candidates=[], disconfirming_evidence="nothing in change_log near onset",
+        confidence="low", corroborated=False, reasoning="x",
+        source={"tool_name": "find_changes", "audit_index": 0},
+    )
+
+    result = CorrelationResult(**payload)
+
+    assert result.corroborated is False
+    assert result.candidates == []
+
+
+def test_brief_result_requires_unresolved_field():
+    with pytest.raises(pydantic.ValidationError, match="unresolved"):
+        BriefResult(
+            summary="s",
+            claims=[
+                {
+                    "text": "t",
+                    "source": {"tool_name": "quantify_impact", "audit_index": 0},
+                }
+            ],
+            recommended_action="a",
+            methodology_notes="m",
+        )
+
+
 def test_claim_reference_rejects_a_tool_name_that_does_not_exist():
     with pytest.raises(pydantic.ValidationError):
         ClaimReference(tool_name="drop_table", audit_index=0)
@@ -319,6 +402,7 @@ def _brief() -> BriefResult:
         ],
         recommended_action="roll back chg-1",
         methodology_notes="severity is an assumption-based heuristic",
+        unresolved=False,
     )
 
 
@@ -432,6 +516,7 @@ _CORRELATION_JSON = json.dumps(
         ],
         "disconfirming_evidence": "only roku degraded despite a global rollout, supporting chg-1",
         "confidence": "high",
+        "corroborated": True,
         "top_candidate_change_id": "chg-1",
         "reasoning": "temporal and dimensional match, corroborated by disconfirming evidence",
         "source": {"tool_name": "find_changes", "audit_index": 2},
@@ -468,6 +553,7 @@ _BRIEF_JSON = json.dumps(
         ],
         "recommended_action": "roll back chg-1",
         "methodology_notes": "severity is an assumption-based heuristic",
+        "unresolved": False,
     }
 )
 
@@ -676,6 +762,7 @@ def test_verify_brief_citations_catches_a_fabricated_audit_index():
         ],
         recommended_action="a",
         methodology_notes="m",
+        unresolved=False,
     )
 
     with pytest.raises(ValueError, match="audit_index"):
@@ -695,6 +782,7 @@ def test_verify_brief_citations_catches_a_tool_name_mismatch_at_a_real_index():
         ],
         recommended_action="a",
         methodology_notes="m",
+        unresolved=False,
     )
 
     with pytest.raises(ValueError, match="tool_name"):

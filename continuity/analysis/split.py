@@ -270,7 +270,16 @@ def _split_arm_sql(
     tag: bool,
 ) -> str:
     """One SELECT ... GROUP BY arm. ``tag`` prefixes a literal dimension-name column
-    so several arms can be told apart after a UNION ALL."""
+    so several arms can be told apart after a UNION ALL.
+
+    ``title_id`` is numeric (``playback_events.title_id``); every other dimension's
+    ``value`` column is a string. Batching them into one ``UNION ALL`` requires every
+    arm's ``value`` column to share a common type, so the ``title_id`` arm projects
+    ``toString(title_id)`` -- the ``GROUP BY`` stays on the raw numeric column, only the
+    projected value changes. Without this cast, ClickHouse rejects the batched query
+    with a ``NO_COMMON_TYPE`` error the moment ``title_id`` is mixed with any other
+    dimension.
+    """
     start, end = window
     raw_events = slice_.requires_raw_events or dimension == TITLE_ID_DIMENSION
     table = RAW_EVENTS_TABLE if raw_events else ROLLUP_TABLE
@@ -278,8 +287,9 @@ def _split_arm_sql(
     metric_expr = metric.sql_for(raw_events=raw_events)
     weight_expr = _weight_sql(metric, raw_events=raw_events)
     dim_tag = f"'{dimension}' AS dim, " if tag else ""
+    value_expr = f"toString({dimension})" if dimension == TITLE_ID_DIMENSION else dimension
     return (
-        f"SELECT {dim_tag}{dimension} AS value, {metric_expr} AS metric_value, "
+        f"SELECT {dim_tag}{value_expr} AS value, {metric_expr} AS metric_value, "
         f"{weight_expr} AS weight FROM {table} "
         f"WHERE {slice_.where_sql()} "
         f"AND {time_col} >= '{_fmt(start)}' AND {time_col} < '{_fmt(end)}' "

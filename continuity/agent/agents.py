@@ -315,6 +315,16 @@ or high) given how the disconfirming evidence came out across all of them, and
 summarize that reasoning in the required disconfirming_evidence field -- fill this in
 even if no candidate survives scrutiny or find_changes returned nothing. Cite the
 find_changes call as `source`, using the audit_index its result carried.
+
+You must also set `corroborated`: True only when at least one candidate is
+still_plausible after weighing its disconfirming evidence -- False whenever
+find_changes returned no candidates at all, or every candidate was rejected or judged
+not still_plausible. ABSENCE OF A CORROBORATING CHANGE IS EVIDENCE AGAINST THE BLAST
+RADIUS, not a neutral null -- do not treat "no candidates" as merely "nothing to
+report." `confidence: "high"` is REJECTED by validation whenever `corroborated` is
+False or `candidates` is empty, so do not attempt to report high confidence in that
+situation; report low or medium confidence and explain, in `disconfirming_evidence`,
+that nothing in change_log corroborates this localisation.
 """
 
 
@@ -361,11 +371,18 @@ band in your answer must equal exactly what the tool returned.
 The investigation so far:
 {investigation_result}
 
+The correlation stage's verdict on whether a cause corroborates this blast radius:
+{correlation_result}
+
 Your job is the methodology_caveat: read the tool's methodology (every coefficient is
 a stated ASSUMPTION, not a measured or trained value -- there is no churn-event ground
 truth in this dataset to calibrate against) and write a plain-language caveat about
-what these figures do and do not support. Cite the quantify_impact call as `source`,
-using the audit_index its result carried.
+what these figures do and do not support. If the correlation above shows
+`corroborated: false` (no plausible cause was found), your methodology_caveat must
+ALSO say so explicitly and note that this figure describes a population that could not
+be tied to any known cause -- it must not be presented as a confident number on its
+own. Cite the quantify_impact call as `source`, using the audit_index its result
+carried.
 """
 
 
@@ -417,6 +434,18 @@ audit_index -- from the `source` field of the stage output that figure came from
 Never invent an audit_index. State a recommended_action: this is a PROPOSAL only, it
 will not be executed by you or by anyone without an explicit human approval step
 afterward. Include methodology_notes summarizing the caveats already stated above.
+
+Set `unresolved` to exactly the opposite of the correlation stage's `corroborated`
+field above (i.e. `unresolved = not correlation_result.corroborated`). When
+`unresolved` is True, this brief MUST say so plainly in the summary -- state that the
+localisation could not be corroborated by any plausible change in change_log -- and
+MUST NOT present the subscriber/ARR figures as a confident finding. In that case, still
+cite the quantify_impact figures if you mention them at all, but frame them explicitly
+as an unreliable, unresolved estimate (e.g. "the affected population cannot yet be
+attributed to a known cause; the following figures are an upper-bound estimate only,
+not a confident finding") -- never as a settled dollar amount. An investigation that
+plainly reports it could not explain an anomaly is more valuable than one that invents
+a confident number.
 """
 
 

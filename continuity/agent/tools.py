@@ -94,10 +94,9 @@ from continuity.analysis.correlate import (
 from continuity.analysis.detect import AnomalyWindow, detect
 from continuity.analysis.impact import Methodology, compute_impact
 from continuity.analysis.metrics import Metric, get_metric
-from continuity.analysis.slices import InvalidSliceError, Slice
+from continuity.analysis.slices import ALLOWED_DIMENSIONS, InvalidSliceError, Slice
 from continuity.analysis.split import Contribution, split_dimensions_median_baseline
 from continuity.analysis.walk import DEFAULT_MIN_LIFT, week_over_week_baseline_windows
-from continuity.data.topology import DIMENSION_HIERARCHY
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
 
 DEFAULT_TOP_N = 8
@@ -710,13 +709,16 @@ class AnalysisTools:
         issuing them one at a time. Splitting device_type, app_version, cdn, isp,
         country, region, os_version and pop as 8 separate tool calls costs 8 turns of
         model reasoning and 8x the tokens for information this ONE call already
-        contains. Only fall back to `split_on_dimension` for a closer look at one
-        dimension you have already identified as promising (e.g. a larger `top_n`, or to
-        re-check it after refining the slice further) -- or for `title_id`, which is
-        NOT a candidate here (it forces the raw-events table and its numeric value
-        column cannot be batched into the same UNION ALL as the other dimensions'
-        string columns); split on it explicitly with `split_on_dimension` if you
-        suspect a per-title fault.
+        contains. `title_id` IS included as a candidate here too -- it forces the
+        raw-events table and its value column is numeric, but its arm of the batched
+        query casts it (`toString(title_id)`) so it unions cleanly with every other
+        dimension's string-valued arm. There are ~500 titles, so only its single
+        TOP-ranked value (by contribution) is ever surfaced here, exactly like every
+        other dimension -- the ~500 candidate values are never dumped into your
+        context. Only fall back to `split_on_dimension` for a closer look at one
+        dimension you have already identified as promising -- a larger `top_n` (e.g.
+        to see more than one title beyond the top-ranked one), or to re-check it after
+        refining the slice further.
 
         For each candidate dimension, only its TOP-ranked value (by contribution) is
         returned, and dimensions are ranked across each other exactly as
@@ -755,30 +757,30 @@ class AnalysisTools:
         Returns:
             On success, a dict with:
             - `dimensions`: one entry per candidate dimension (every dimension in
-              `topology.DIMENSION_HIERARCHY` not already pinned in `slice_json` --
-              `title_id` is never a candidate here, see above), sorted by
-              `share_of_deviation` descending among dimensions whose top value's lift
-              clears `walk.DEFAULT_MIN_LIFT`, then by `lift` descending among the rest
-              (see the ranking above). Each entry carries `dimension`, `informative`
-              (see `split_on_dimension`), `top_value`, `weight_share`,
-              `share_of_deviation`, `lift`, `meets_lift_gate` (`False` means this
-              dimension's top value is not worth descending into, however high its
-              share looks), and `note` (why a field is `None`, or `"no data for this
-              dimension in the window"` when the dimension had no rows at all here).
+              `slices.ALLOWED_DIMENSIONS` -- the 8-dimension hierarchy plus `title_id`
+              -- not already pinned in `slice_json`), sorted by `share_of_deviation`
+              descending among dimensions whose top value's lift clears
+              `walk.DEFAULT_MIN_LIFT`, then by `lift` descending among the rest (see the
+              ranking above). Each entry carries `dimension`, `informative` (see
+              `split_on_dimension`), `top_value`, `weight_share`, `share_of_deviation`,
+              `lift`, `meets_lift_gate` (`False` means this dimension's top value is
+              not worth descending into, however high its share looks), and `note`
+              (why a field is `None`, or `"no data for this dimension in the window"`
+              when the dimension had no rows at all here).
             - `sql`, `baseline_sql`: the one batched query (per window) behind every
               dimension's result -- all dimensions share the same two queries, so this
               is not repeated per dimension.
 
-            If `slice_json` already pins every candidate dimension, `dimensions` is an
-            empty list with a `note` explaining there is nothing left to split -- a
-            real finding, not an error.
+            If `slice_json` already pins every candidate dimension (including
+            `title_id`), `dimensions` is an empty list with a `note` explaining there
+            is nothing left to split -- a real finding, not an error.
 
             On failure, `{"error": ..., "error_type": ...}` -- see the module docstring.
 
             What this tool does NOT tell you: a value beyond each dimension's own top
-            one -- call `split_on_dimension` with a larger `top_n` for that, or for
-            `title_id`. It also does not tell you the TRUE onset/end of the incident on
-            the slice you pick -- call `refine_incident_span` for that once localized.
+            one -- call `split_on_dimension` with a larger `top_n` for that. It also
+            does not tell you the TRUE onset/end of the incident on the slice you pick
+            -- call `refine_incident_span` for that once localized.
         """
         try:
             slice_ = _parse_slice(slice_json)
@@ -789,7 +791,8 @@ class AnalysisTools:
         except (InvalidSliceError, KeyError, ValueError) as exc:
             return _error(str(exc), "invalid_input")
 
-        candidate_dimensions = sorted(d for d in DIMENSION_HIERARCHY if d not in slice_.dimensions)
+        pinned = {*slice_.dimensions}
+        candidate_dimensions = sorted(d for d in ALLOWED_DIMENSIONS if d not in pinned)
         if not candidate_dimensions:
             return {
                 "slice": _slice_repr(slice_),

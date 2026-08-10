@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # The seven analysis primitives from ``continuity/agent/tools.py``, and nothing
 # else -- a ``ClaimReference`` citing anything outside this set fails Pydantic
@@ -153,6 +153,15 @@ class CorrelationResult(BaseModel):
     -- a model that ranks candidates without engaging with the disconfirming
     evidence ``find_changes`` returned fails schema validation, it does not
     quietly produce an unexamined answer.
+
+    ``corroborated`` is likewise REQUIRED -- the model must explicitly state whether
+    the blast radius is actually corroborated by a change, rather than leaving that
+    judgement implicit in ``confidence`` alone. Absence of a correlating change is
+    EVIDENCE AGAINST the blast radius, not a neutral null, so the validator below makes
+    ``confidence: "high"`` unrepresentable whenever there is nothing to corroborate
+    with: either ``candidates`` is empty, or ``corroborated`` is ``False``. This is
+    enforced at the type level (a genuine Pydantic ``ValidationError``), not merely
+    requested in the prompt -- a model cannot talk its way past it.
     """
 
     candidates: list[RankedCandidate] = Field(default_factory=list)
@@ -163,11 +172,32 @@ class CorrelationResult(BaseModel):
         "Must be filled in even when no candidates were returned.",
     )
     confidence: Literal["low", "medium", "high"]
+    corroborated: bool = Field(
+        description="Whether the blast radius is actually corroborated by a "
+        "still-plausible change candidate. Must be False when candidates is empty -- "
+        "there is nothing to corroborate with. False here means the localisation is "
+        "unresolved: report it as such, never as a confident finding."
+    )
     top_candidate_change_id: str | None = Field(
         default=None, description="null when candidates is empty."
     )
     reasoning: str = Field(min_length=1)
     source: ClaimReference = Field(description="The find_changes call all candidates came from.")
+
+    @model_validator(mode="after")
+    def _high_confidence_requires_corroboration(self) -> CorrelationResult:
+        if not self.candidates and self.corroborated:
+            raise ValueError(
+                "corroborated cannot be True when candidates is empty -- there is no "
+                "change to corroborate the blast radius with."
+            )
+        if self.confidence == "high" and not self.corroborated:
+            raise ValueError(
+                "confidence cannot be 'high' when corroborated is False -- absence of "
+                "a corroborating change is evidence AGAINST the blast radius, never "
+                "grounds for high confidence."
+            )
+        return self
 
 
 class QuantifyResult(BaseModel):
@@ -200,6 +230,13 @@ class BriefResult(BaseModel):
     ``claims`` requires at least one entry, and every entry carries a
     ``ClaimReference`` -- a brief with zero traceable claims is a validation
     error, not an empty-but-valid document.
+
+    ``unresolved`` is REQUIRED (no default) -- the model must explicitly say whether
+    CORRELATE could corroborate the blast radius (``correlation_result.corroborated``)
+    or not. When ``True``, this brief must say plainly that the localisation could not
+    be corroborated by a plausible cause and that any impact figure is therefore
+    unreliable -- it must NOT present a confident dollar figure. A system that reports
+    "I could not explain this" is more valuable than one that invents a number.
     """
 
     summary: str = Field(min_length=1)
@@ -211,6 +248,13 @@ class BriefResult(BaseModel):
         "an ActProposal only behind an explicit human approval gate.",
     )
     methodology_notes: str = Field(min_length=1)
+    unresolved: bool = Field(
+        description="True when correlation_result.corroborated is False -- the "
+        "localisation could not be corroborated by any plausible change. When True, "
+        "the summary/claims must state this plainly and must NOT present a confident "
+        "dollar figure; the impact figure (if mentioned at all) must be caveated as "
+        "unreliable, not reported as a finding."
+    )
 
 
 class ActProposal(BaseModel):

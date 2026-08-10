@@ -110,6 +110,7 @@ class ArmResult:
     stop_reason: str | None = None
     top_change_id: str | None = None
     confidence: str | None = None
+    unresolved: bool | None = None
     affected_subscribers: int | None = None
     arr_at_risk_low: str | None = None
     arr_at_risk_expected: str | None = None
@@ -342,6 +343,7 @@ async def run_agent_arm(
         stop_reason=result.investigation.stop_reason,
         top_change_id=str(top_id) if top_id is not None else None,
         confidence=result.correlation.confidence,
+        unresolved=result.brief.unresolved,
         affected_subscribers=result.quantify.affected_subscribers,
         arr_at_risk_low=result.quantify.arr_at_risk_low,
         arr_at_risk_expected=result.quantify.arr_at_risk_expected,
@@ -553,6 +555,12 @@ def _render_arm(label: str, arm: ArmResult, score: IncidentScore) -> list[str]:
             lines.append(
                 f"      attribution  : top=#{arm.top_change_id} vs true=#{score.true_change_id} "
                 f"-> {attr_text}"
+            )
+        if arm.unresolved:
+            lines.append(
+                "      UNRESOLVED   : localisation could not be corroborated by any "
+                "plausible change -- the brief itself says so; treat the impact figure "
+                "below as an unreliable estimate, not a confident finding"
             )
         ref = score.reference_impact
         if ref and "error" not in ref:
