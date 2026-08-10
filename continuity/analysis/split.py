@@ -44,9 +44,18 @@ Weighting is explicit per metric (requirement 2 of Task 5):
   count bounds each session's influence to one unit of weight.
 
 Two queries per split -- one over ``window``, one over ``baseline_window`` -- regardless
-of how many dimensions are requested: ``split_dimensions`` batches all of them into a
-single ``UNION ALL`` per window (see ``scripts/benchmark_queries.py``, which measured this
-at ~43ms for 8 dimensions vs ~183ms issued one at a time).
+of how many dimensions are requested, AS LONG AS every dimension shares one required
+table: ``split_dimensions`` batches all of them into a single ``UNION ALL`` per window
+(see ``scripts/benchmark_queries.py``, which measured this at ~43ms for 8 dimensions vs
+~183ms issued one at a time). A dimension that forces ``playback_events`` instead of
+``qoe_rollup_5m`` (currently only ``title_id`` -- see ``slices.dimension_required_table``)
+is issued as its OWN query per window rather than unioned with the rollup-backed arms:
+mixing a raw-events scan into the same statement as the cheap rollup arms would force
+every arm to share that one query's memory budget for its whole lifetime, which is
+exactly the defect this module used to have. ``split_dimensions``/
+``split_dimensions_median_baseline`` therefore issue one query pair (or query-plus-
+medians) PER REQUIRED TABLE among the requested dimensions, not per dimension -- the
+batching win is preserved within each table, just no longer smeared across tables.
 """
 
 from __future__ import annotations
@@ -63,10 +72,10 @@ from continuity.analysis.metrics import Metric
 from continuity.analysis.slices import (
     ALLOWED_DIMENSIONS,
     RAW_EVENTS_TABLE,
-    ROLLUP_TABLE,
     TITLE_ID_DIMENSION,
     InvalidSliceError,
     Slice,
+    dimension_required_table,
 )
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway
 
@@ -281,8 +290,8 @@ def _split_arm_sql(
     dimension.
     """
     start, end = window
-    raw_events = slice_.requires_raw_events or dimension == TITLE_ID_DIMENSION
-    table = RAW_EVENTS_TABLE if raw_events else ROLLUP_TABLE
+    table = dimension_required_table(slice_, dimension)
+    raw_events = table == RAW_EVENTS_TABLE
     time_col = "event_time" if raw_events else "bucket"
     metric_expr = metric.sql_for(raw_events=raw_events)
     weight_expr = _weight_sql(metric, raw_events=raw_events)
@@ -309,6 +318,29 @@ def _build_batched_split_sql(
     return " UNION ALL ".join(
         _split_arm_sql(slice_, metric, dimension, window, tag=True) for dimension in dimensions
     )
+
+
+def _group_dimensions_by_table(slice_: Slice, dimensions: Sequence[str]) -> list[list[str]]:
+    """Group `dimensions` by the table a GROUP BY on each requires (see
+    `slices.dimension_required_table`), preserving relative order both across and
+    within groups. A rollup-backed dimension and a raw-events-backed one (currently
+    only title_id) must never end up batched into the same UNION ALL -- see the module
+    docstring's benchmark and the `Slice`/query-cost defect this fixes: unioning a
+    handful of cheap rollup arms with one arm that scans `playback_events` over the
+    full window forces every arm to share that one query's memory budget for its
+    whole lifetime, defeating the reason the rollup exists. This function does not
+    name `title_id` itself -- a future raw-events-only dimension is grouped correctly
+    with no change here.
+    """
+    order: list[str] = []
+    groups: dict[str, list[str]] = {}
+    for dimension in dimensions:
+        table = dimension_required_table(slice_, dimension)
+        if table not in groups:
+            groups[table] = []
+            order.append(table)
+        groups[table].append(dimension)
+    return [groups[table] for table in order]
 
 
 def _to_float_or_none(value: Any) -> float | None:
@@ -396,8 +428,12 @@ async def split_dimensions(
     window: tuple[datetime, datetime],
     baseline_window: tuple[datetime, datetime],
 ) -> dict[str, SplitResult]:
-    """Split ``slice_`` on MANY dimensions, batched into a single UNION ALL query per
-    window -- two queries total, not two per dimension.
+    """Split ``slice_`` on MANY dimensions, batched into one UNION ALL query per
+    window PER REQUIRED TABLE -- two queries total when every dimension shares a
+    table (the common case), never one query per dimension. A dimension that forces
+    ``playback_events`` (currently only ``title_id``) is issued as its own query
+    rather than unioned with the ``qoe_rollup_5m``-backed arms -- see
+    ``_group_dimensions_by_table``.
     """
     if not dimensions:
         raise ValueError("dimensions must be non-empty")
@@ -406,32 +442,44 @@ async def split_dimensions(
     _validate_window(window)
     _validate_window(baseline_window)
 
-    sql = _build_batched_split_sql(slice_, metric, dimensions, window)
-    baseline_sql = _build_batched_split_sql(slice_, metric, dimensions, baseline_window)
-    window_result = await gateway.query(sql)
-    baseline_result = await gateway.query(baseline_sql)
+    groups = _group_dimensions_by_table(slice_, dimensions)
 
-    window_by_dim = _group_by_dim(window_result.rows)
-    baseline_by_dim = _group_by_dim(baseline_result.rows)
+    window_by_dim: dict[str, list[dict[str, Any]]] = {}
+    baseline_by_dim: dict[str, list[dict[str, Any]]] = {}
+    sql_by_dim: dict[str, str] = {}
+    baseline_sql_by_dim: dict[str, str] = {}
+    for group in groups:
+        sql = _build_batched_split_sql(slice_, metric, group, window)
+        baseline_sql = _build_batched_split_sql(slice_, metric, group, baseline_window)
+        window_result = await gateway.query(sql)
+        baseline_result = await gateway.query(baseline_sql)
+
+        group_window_by_dim = _group_by_dim(window_result.rows)
+        group_baseline_by_dim = _group_by_dim(baseline_result.rows)
+        for dimension in group:
+            window_by_dim[dimension] = group_window_by_dim.get(dimension, [])
+            baseline_by_dim[dimension] = group_baseline_by_dim.get(dimension, [])
+            sql_by_dim[dimension] = sql
+            baseline_sql_by_dim[dimension] = baseline_sql
 
     results: dict[str, SplitResult] = {}
     for dimension in dimensions:
         measurements = _rows_to_measurements(
-            window_by_dim.get(dimension, []), baseline_by_dim.get(dimension, [])
+            window_by_dim[dimension], baseline_by_dim[dimension]
         )
         values = rank_contributions(
             measurements,
             dimension=dimension,
             higher_is_worse=metric.higher_is_worse,
-            sql=sql,
-            baseline_sql=baseline_sql,
+            sql=sql_by_dim[dimension],
+            baseline_sql=baseline_sql_by_dim[dimension],
         )
         results[dimension] = SplitResult(
             dimension=dimension,
             values=values,
             informative=is_informative(measurements),
-            sql=sql,
-            baseline_sql=baseline_sql,
+            sql=sql_by_dim[dimension],
+            baseline_sql=baseline_sql_by_dim[dimension],
         )
     return results
 
@@ -503,10 +551,15 @@ async def split_dimensions_median_baseline(
     preceding `lookback_weeks` weeks, matching baseline.py's week-over-week convention)
     rather than one -- see the module-level section docstring above for why.
 
-    Issues `1 + len(baseline_windows)` queries total, each still batched across every
-    dimension in one UNION ALL (per Task 1's benchmark: batching all dimensions into
-    one query measured at 43ms versus 183ms issued one at a time) -- never one query
-    per dimension.
+    Issues `1 + len(baseline_windows)` queries PER REQUIRED TABLE, each still batched
+    across every dimension that shares that table in one UNION ALL (per Task 1's
+    benchmark: batching all dimensions into one query measured at 43ms versus 183ms
+    issued one at a time) -- never one query per dimension. A dimension that forces
+    `playback_events` (currently only `title_id`) is issued in its own set of queries
+    rather than unioned with the `qoe_rollup_5m`-backed arms -- see
+    `_group_dimensions_by_table`; putting an arm that scans the full raw-events window
+    in the same statement as the cheap rollup arms would make every arm share that one
+    query's memory budget for its whole lifetime.
     """
     if not dimensions:
         raise ValueError("dimensions must be non-empty")
@@ -518,38 +571,51 @@ async def split_dimensions_median_baseline(
     for baseline_window in baseline_windows:
         _validate_window(baseline_window)
 
-    sql = _build_batched_split_sql(slice_, metric, dimensions, window)
-    baseline_sqls = [
-        _build_batched_split_sql(slice_, metric, dimensions, bw) for bw in baseline_windows
-    ]
-    window_result = await gateway.query(sql)
-    baseline_results = [await gateway.query(baseline_sql) for baseline_sql in baseline_sqls]
+    groups = _group_dimensions_by_table(slice_, dimensions)
 
-    window_by_dim = _group_by_dim(window_result.rows)
-    baseline_by_dim_per_window = [_group_by_dim(r.rows) for r in baseline_results]
-    # Provenance carries every baseline query that fed the median, not just one.
-    baseline_sql = "\n-- UNION (median across windows) --\n".join(baseline_sqls)
+    window_by_dim: dict[str, list[dict[str, Any]]] = {}
+    baseline_by_dim_per_window: dict[str, list[list[dict[str, Any]]]] = {}
+    sql_by_dim: dict[str, str] = {}
+    baseline_sqls_by_dim: dict[str, list[str]] = {}
+    for group in groups:
+        sql = _build_batched_split_sql(slice_, metric, group, window)
+        baseline_sqls = [
+            _build_batched_split_sql(slice_, metric, group, bw) for bw in baseline_windows
+        ]
+        window_result = await gateway.query(sql)
+        baseline_results = [await gateway.query(baseline_sql) for baseline_sql in baseline_sqls]
+
+        group_window_by_dim = _group_by_dim(window_result.rows)
+        group_baseline_by_dim_per_window = [_group_by_dim(r.rows) for r in baseline_results]
+        for dimension in group:
+            window_by_dim[dimension] = group_window_by_dim.get(dimension, [])
+            baseline_by_dim_per_window[dimension] = [
+                by_dim.get(dimension, []) for by_dim in group_baseline_by_dim_per_window
+            ]
+            sql_by_dim[dimension] = sql
+            baseline_sqls_by_dim[dimension] = baseline_sqls
 
     results: dict[str, SplitResult] = {}
     for dimension in dimensions:
-        baseline_rows_per_window = [
-            by_dim.get(dimension, []) for by_dim in baseline_by_dim_per_window
-        ]
         measurements = _rows_to_measurements_median_baseline(
-            window_by_dim.get(dimension, []), baseline_rows_per_window
+            window_by_dim[dimension], baseline_by_dim_per_window[dimension]
+        )
+        # Provenance carries every baseline query that fed the median, not just one.
+        baseline_sql = "\n-- UNION (median across windows) --\n".join(
+            baseline_sqls_by_dim[dimension]
         )
         values = rank_contributions(
             measurements,
             dimension=dimension,
             higher_is_worse=metric.higher_is_worse,
-            sql=sql,
+            sql=sql_by_dim[dimension],
             baseline_sql=baseline_sql,
         )
         results[dimension] = SplitResult(
             dimension=dimension,
             values=values,
             informative=is_informative(measurements),
-            sql=sql,
+            sql=sql_by_dim[dimension],
             baseline_sql=baseline_sql,
         )
     return results

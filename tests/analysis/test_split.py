@@ -5,7 +5,7 @@ one at a time.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -18,6 +18,7 @@ from continuity.analysis.split import (
     rank_contributions,
     split_dimension,
     split_dimensions,
+    split_dimensions_median_baseline,
 )
 from continuity.gateway.mcp_gateway import QueryResult
 
@@ -325,6 +326,86 @@ async def test_batched_split_matches_result_of_separate_single_dimension_splits(
 
     assert batched["device_type"].values[0].value == "roku"
     assert batched["app_version"].values[0].value == "8.2.0"
+
+
+# ---------------------------------------------------------------------------
+# Query-cost fix: title_id forces playback_events while every other dimension stays
+# on qoe_rollup_5m -- the two must never be UNION ALL'd into one statement, or the
+# cheap rollup arms are forced to share the expensive raw-events arm's memory budget
+# for the whole query's lifetime. This is the defect the fix guards against; nobody
+# may re-merge them into one batched query later.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGateway:
+    """Records every SQL string issued; returns empty rows regardless of query text --
+    only the SHAPE (how many queries, which table each names) matters here, not the
+    ranking maths, which is already covered above."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    async def query(self, sql: str) -> QueryResult:
+        self.queries.append(sql)
+        return QueryResult(sql=sql, columns=[], rows=[])
+
+
+def _assert_rollup_and_raw_events_never_share_a_query(queries: list[str]) -> None:
+    for sql in queries:
+        assert not ("qoe_rollup_5m" in sql and "playback_events" in sql), (
+            f"a rollup-backed arm and a raw-events-backed arm were batched into one "
+            f"query -- they must be issued separately: {sql}"
+        )
+
+
+async def test_split_dimensions_issues_separate_queries_for_rollup_and_raw_events_dimensions():
+    window = (datetime(2026, 2, 18, 9, 0, 0), datetime(2026, 2, 19, 15, 0, 0))
+    baseline_window = (datetime(2026, 2, 11, 9, 0, 0), datetime(2026, 2, 12, 15, 0, 0))
+    fake = _RecordingGateway()
+
+    await split_dimensions(
+        fake,
+        slice_=Slice(),
+        metric=METRICS["bitrate"],
+        dimensions=["device_type", "app_version", "title_id"],
+        window=window,
+        baseline_window=baseline_window,
+    )
+
+    _assert_rollup_and_raw_events_never_share_a_query(fake.queries)
+    raw_queries = [q for q in fake.queries if "playback_events" in q]
+    rollup_queries = [q for q in fake.queries if "qoe_rollup_5m" in q]
+    assert len(raw_queries) == 2  # title_id: one window query, one baseline query
+    assert len(rollup_queries) == 2  # device_type + app_version batched: window + baseline
+    assert len(fake.queries) == 4  # never one combined query, never one per dimension
+    assert all("title_id" not in q for q in rollup_queries)
+    assert all("device_type" not in q and "app_version" not in q for q in raw_queries)
+
+
+async def test_split_dimensions_median_baseline_issues_separate_queries_for_raw_events_dimension():
+    """The variant `walk.py` actually uses in production. Query count is
+    2 (tables) * (1 window + len(baseline_windows)), not 1 * (1 + len(baseline_windows))."""
+    window = (datetime(2026, 2, 18, 9, 0, 0), datetime(2026, 2, 19, 15, 0, 0))
+    baseline_windows = tuple(
+        (window[0] - timedelta(weeks=i), window[1] - timedelta(weeks=i)) for i in range(1, 3)
+    )
+    fake = _RecordingGateway()
+
+    await split_dimensions_median_baseline(
+        fake,
+        slice_=Slice(),
+        metric=METRICS["bitrate"],
+        dimensions=["device_type", "title_id"],
+        window=window,
+        baseline_windows=baseline_windows,
+    )
+
+    _assert_rollup_and_raw_events_never_share_a_query(fake.queries)
+    raw_queries = [q for q in fake.queries if "playback_events" in q]
+    rollup_queries = [q for q in fake.queries if "qoe_rollup_5m" in q]
+    assert len(raw_queries) == 1 + len(baseline_windows)
+    assert len(rollup_queries) == 1 + len(baseline_windows)
+    assert len(fake.queries) == 2 * (1 + len(baseline_windows))
 
 
 async def test_split_dimension_rejects_unknown_dimension():

@@ -478,7 +478,15 @@ async def test_split_on_dimension_sorts_lift_gate_failures_after_qualifying_valu
 def _split_all_responses() -> list[QueryResult]:
     """Only `app_version` carries real rows (two values, one wildly worse -> high
     lift); every other candidate dimension has no rows at all, so the tool must
-    report those as "no data" rather than erroring the whole call."""
+    report those as "no data" rather than erroring the whole call.
+
+    `split_all_dimensions` batches every rollup-backed candidate (app_version, cdn,
+    country, device_type, isp, os_version, pop, region) into one query pair and
+    `title_id` -- the one candidate that forces `playback_events` -- into its OWN
+    query pair (see continuity/analysis/slices.py's `dimension_required_table`), so
+    this fixture supplies 1 + DEFAULT_LOOKBACK_WEEKS responses for EACH group, in the
+    order the two groups are issued (rollup group first, then the raw-events group,
+    since `title_id` sorts last alphabetically among ALLOWED_DIMENSIONS)."""
     window_rows = [
         {"dim": "app_version", "value": "8.2.0", "metric_value": 0.05, "weight": 10_000.0},
         {"dim": "app_version", "value": "8.1.0", "metric_value": 0.001, "weight": 10_000.0},
@@ -487,7 +495,9 @@ def _split_all_responses() -> list[QueryResult]:
         {"dim": "app_version", "value": "8.2.0", "metric_value": 0.001, "weight": 10_000.0},
         {"dim": "app_version", "value": "8.1.0", "metric_value": 0.001, "weight": 10_000.0},
     ]
-    return [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    rollup_group = [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    raw_events_group = [_qr([]) for _ in range(1 + 4)]  # title_id: no rows at all
+    return rollup_group + raw_events_group
 
 
 async def test_split_all_dimensions_ranks_by_lift_and_excludes_the_pinned_dimension():
@@ -524,14 +534,18 @@ async def test_split_all_dimensions_reports_dimensions_with_no_rows_as_no_data()
 async def test_split_all_dimensions_includes_title_id_as_a_candidate():
     """DEFECT 1: title_id used to be structurally excluded from split_all_dimensions,
     making the tool blind to per-title faults (INC-ENCODE-1). It must now appear
-    alongside every other candidate dimension, cast to a string so it unions cleanly
-    with the other (string-valued) arms."""
-    tools = AnalysisTools(_FakeGateway(_split_all_responses()))
+    alongside every other candidate dimension, cast to a string in its own query
+    (see the query-cost fix: title_id forces playback_events and is issued
+    separately from the qoe_rollup_5m-backed dimensions, so it no longer appears in
+    the aggregated ``sql`` field returned for the batch -- checked here against the
+    actual queries issued instead)."""
+    fake = _FakeGateway(_split_all_responses())
+    tools = AnalysisTools(fake)
 
     result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
 
     assert "title_id" in {d["dimension"] for d in result["dimensions"]}
-    assert "toString(title_id)" in result["sql"]
+    assert any("toString(title_id)" in q for q in fake.queries)
 
 
 async def test_split_all_dimensions_excludes_title_id_once_pinned():
@@ -544,15 +558,30 @@ async def test_split_all_dimensions_excludes_title_id_once_pinned():
     assert "title_id" not in {d["dimension"] for d in result["dimensions"]}
 
 
-async def test_split_all_dimensions_issues_exactly_one_query_pair_for_every_dimension():
-    """The whole point of DEFECT 3: one batched window query and one batched
-    baseline query per lookback week, never one pair per dimension."""
+async def test_split_all_dimensions_issues_one_query_pair_per_required_table():
+    """DEFECT 3's batching win (one batched window query and one batched baseline
+    query per lookback week, never one pair per dimension) holds WITHIN each table --
+    but `title_id` forces `playback_events` while every other candidate dimension
+    stays on `qoe_rollup_5m`, so those two groups must be issued as separate query
+    pairs, not unioned into one. Mixing an arm that scans the full raw-events window
+    into the same statement as the cheap rollup arms would force every arm to share
+    that one query's memory budget -- the exact defect this fixes."""
     fake = _FakeGateway(_split_all_responses())
     tools = AnalysisTools(fake)
 
     await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
 
-    assert len(fake.queries) == 1 + DEFAULT_LOOKBACK_WEEKS
+    assert len(fake.queries) == 2 * (1 + DEFAULT_LOOKBACK_WEEKS)
+    # The rollup-backed batch and the raw-events-backed (title_id) query must never
+    # be the same SQL statement -- see the module docstring above.
+    rollup_queries = [q for q in fake.queries if "qoe_rollup_5m" in q]
+    raw_queries = [q for q in fake.queries if "playback_events" in q]
+    assert rollup_queries and raw_queries
+    assert not (set(rollup_queries) & set(raw_queries))
+    for q in raw_queries:
+        assert "qoe_rollup_5m" not in q
+    for q in rollup_queries:
+        assert "playback_events" not in q
 
 
 async def test_split_all_dimensions_returns_empty_list_when_every_dimension_is_pinned():
@@ -630,7 +659,9 @@ def _proportional_subset_trap_responses() -> list[QueryResult]:
             for i in range(4)
         ),
     ]
-    return [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    rollup_group = [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    raw_events_group = [_qr([]) for _ in range(1 + 4)]  # title_id: no rows at all
+    return rollup_group + raw_events_group
 
 
 async def test_split_all_dimensions_prefers_broader_value_over_equal_lift_subset_trap():
@@ -697,7 +728,9 @@ async def test_split_all_dimensions_ranks_by_share_not_by_lift_among_qualifying_
             for i in range(5)
         ),
     ]
-    responses = [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    rollup_group = [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    raw_events_group = [_qr([]) for _ in range(1 + 4)]  # title_id: no rows at all
+    responses = rollup_group + raw_events_group
     tools = AnalysisTools(_FakeGateway(responses))
 
     result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
@@ -900,7 +933,11 @@ async def test_split_all_dimensions_finds_title_id_for_the_real_encode_fault(gat
     )
     assert top["top_value"] == "1"
     assert top["lift"] is not None and top["lift"] > 1.5
-    assert "toString(title_id)" in result["sql"]
+    # title_id forces playback_events and is issued as its OWN query, separate from
+    # the qoe_rollup_5m-backed dimensions (see the query-cost fix) -- checked against
+    # the actual queries issued rather than the aggregated `sql` field, which now
+    # reflects only one of the (no longer identical) per-table batches.
+    assert any("toString(title_id)" in q.sql for q in gateway.query_log)
 
 
 @pytest.mark.integration

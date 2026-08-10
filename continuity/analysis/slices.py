@@ -27,6 +27,13 @@ ALLOWED_DIMENSIONS: frozenset[str] = frozenset({*DIMENSION_HIERARCHY, TITLE_ID_D
 ROLLUP_TABLE = "qoe_rollup_5m"
 RAW_EVENTS_TABLE = "playback_events"
 
+# Dimensions that must be read from RAW_EVENTS_TABLE regardless of which table the
+# enclosing Slice's own predicates would otherwise allow -- title_id is excluded from
+# the rollup for cardinality reasons (see continuity/data/schema.py). A future
+# raw-events-only dimension is added here, not by special-casing its name at each
+# call site that groups dimensions by table (see `dimension_required_table`).
+RAW_ONLY_DIMENSIONS: frozenset[str] = frozenset({TITLE_ID_DIMENSION})
+
 
 class InvalidSliceError(ValueError):
     """Raised when a Slice predicate names an unknown dimension or an unsafe value."""
@@ -123,3 +130,19 @@ class Slice:
             return "(all)"
         ordered = sorted(self.predicates, key=lambda kv: _sort_key(kv[0]))
         return " / ".join(v for _, v in ordered)
+
+
+def dimension_required_table(slice_: Slice, dimension: str) -> str:
+    """Which table answers a GROUP BY on `dimension` within `slice_`'s predicate.
+
+    RAW_EVENTS_TABLE when either the slice's own predicates force it (`slice_` already
+    pins a raw-only dimension, e.g. title_id) or `dimension` itself does (it is in
+    `RAW_ONLY_DIMENSIONS`) -- ROLLUP_TABLE otherwise. Callers that batch several
+    dimensions into one query (see continuity/analysis/split.py) must group by this
+    value first and never UNION ALL a rollup-backed arm with a raw-events-backed one:
+    mixing them forces the cheap rollup arms to share the expensive raw-events arm's
+    memory budget for the query's whole lifetime.
+    """
+    if slice_.requires_raw_events or dimension in RAW_ONLY_DIMENSIONS:
+        return RAW_EVENTS_TABLE
+    return ROLLUP_TABLE
