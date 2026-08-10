@@ -179,17 +179,29 @@ Your tools:
   slice and window. Use it to confirm a candidate's own deviation before, or after,
   you commit to it.
 - split_all_dimensions: breaks your current slice down by EVERY candidate dimension not
-  already pinned, in ONE call, ranked by lift. CALL THIS FIRST at every level of
-  descent, before reaching for split_on_dimension -- it replaces what would otherwise
-  be several separate single-dimension calls for the same information.
-- split_on_dimension: breaks a slice down by ONE dimension you already suspect and
-  ranks each value by contribution AND lift. Only use this for a closer look at a
-  single dimension (e.g. more values than split_all_dimensions' top-one, or to re-check
-  a dimension after refining further) -- LIFT IS THE SIGNAL TO ACT ON either way, not
-  raw share or raw contribution: lift around 1.0 means a value is just a big population
-  segment, not a cause; lift meaningfully above 1.0 (roughly above 1.5) means that value
-  is genuinely worse than its size predicts and is worth descending into. Lift below
-  1.0, or null, means do not chase that value no matter how large its share looks.
+  already pinned, in ONE call, ranked by share_of_deviation among dimensions whose top
+  value clears the lift gate (meets_lift_gate: true), with non-qualifying dimensions
+  sorted after. CALL THIS FIRST at every level of descent, before reaching for
+  split_on_dimension -- it replaces what would otherwise be several separate
+  single-dimension calls for the same information.
+- split_on_dimension: breaks a slice down by ONE dimension you already suspect, ranked
+  the same way. Only use this for a closer look at a single dimension (e.g. more values
+  than split_all_dimensions' top-one, or to re-check a dimension after refining
+  further).
+- BOTH tools' lift and share_of_deviation answer different questions and you need both,
+  in this order: lift is a GATE ("is this value genuinely worse than its size predicts,
+  or is it just big?") -- around 1.0 it is just a big population segment, not a cause;
+  meaningfully above 1.0 (roughly above 1.5, meets_lift_gate: true) it is worth
+  descending into; below that, or null, do NOT chase it no matter how large its share
+  looks. share_of_deviation is the RANKING ("how much of the problem does this value
+  explain?") among values that clear the gate -- prefer the HIGHEST share. THE TRAP: a
+  proportional SUBSET of the true blast radius (e.g. one os_version out of several that
+  make up a genuinely-affected device_type) can carry the SAME lift as the broader,
+  true value while explaining only a fraction of its share_of_deviation -- lift is
+  scale-invariant and cannot tell the two apart, share_of_deviation can. When two
+  candidates' lifts are both comfortably above the gate, prefer the one with the larger
+  share_of_deviation -- the BROADER value that explains more of the incident beats a
+  narrower, equally-concentrated subset.
 - refine_incident_span: once you have localized a slice, re-detects directly on it
   (never the whole population) to find its TRUE onset/end -- population-level
   detection dilutes a narrowly-scoped fault and understates both its span and its
@@ -200,12 +212,15 @@ Your tools:
 Procedure:
 1. Form a hypothesis about which dimension might explain the deviation.
 2. Call split_all_dimensions on your current slice (start from the whole population,
-   i.e. an empty slice) to see every candidate dimension's top value and lift in one
-   call.
-3. Read the lift of the best-ranked dimension's top value. If it is meaningfully above
-   1.0, refine your slice to pin that value and repeat from step 2 -- split_all_dimensions
-   automatically excludes any dimension already pinned. Use split_on_dimension only if
-   you need a closer look at one dimension.
+   i.e. an empty slice) to see every candidate dimension's top value, its
+   share_of_deviation, and its lift in one call.
+3. Take the best-ranked entry: the highest share_of_deviation among dimensions whose
+   top value clears the lift gate (meets_lift_gate: true). If one exists, refine your
+   slice to pin that value and repeat from step 2 -- split_all_dimensions automatically
+   excludes any dimension already pinned. If more than one candidate clears the gate
+   with comparable lift, prefer the one with the larger share_of_deviation -- a broader
+   value that explains more of the incident beats a narrower, equally-concentrated
+   subset. Use split_on_dimension only if you need a closer look at one dimension.
 4. Stop descending as soon as any of these holds, and record which one as
    stop_reason:
    - low_lift: the best remaining candidate's lift is not meaningfully above 1.0.

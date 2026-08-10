@@ -96,7 +96,7 @@ from continuity.analysis.impact import Methodology, compute_impact
 from continuity.analysis.metrics import Metric, get_metric
 from continuity.analysis.slices import InvalidSliceError, Slice
 from continuity.analysis.split import Contribution, split_dimensions_median_baseline
-from continuity.analysis.walk import week_over_week_baseline_windows
+from continuity.analysis.walk import DEFAULT_MIN_LIFT, week_over_week_baseline_windows
 from continuity.data.topology import DIMENSION_HIERARCHY
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
 
@@ -222,6 +222,29 @@ def _window_dict(window: AnomalyWindow) -> dict[str, Any]:
     }
 
 
+def _meets_lift_gate(lift: float | None) -> bool:
+    """`True` when `lift` clears `walk.DEFAULT_MIN_LIFT` -- the SAME gate the
+    deterministic walker (`walk.py::choose_next_step`) uses to decide whether a
+    candidate is worth descending into at all. Reused here, never reinvented, so
+    this tool layer and the walker it is scored against can never disagree on what
+    counts as "genuinely concentrated" versus "just big"."""
+    return lift is not None and lift >= DEFAULT_MIN_LIFT
+
+
+def _share_rank_key(lift: float | None, share: float | None) -> tuple[int, float, float]:
+    """The walker's own two-part ranking, exactly as `choose_next_step` applies it:
+    `lift` GATES (candidates that clear it sort before every candidate that does
+    not), `share_of_deviation` RANKS -- descending -- among the ones that clear the
+    gate. A candidate that fails the gate is never dropped, only sorted after every
+    qualifying one; among the failing candidates themselves, the ordering is by
+    `lift` descending (a `None` lift sorts last of all) so "how close it came" is
+    still visible rather than arbitrary.
+    """
+    if _meets_lift_gate(lift):
+        return (0, -(share if share is not None else 0.0), 0.0)
+    return (1, 0.0 if lift is not None else 1.0, -(lift if lift is not None else 0.0))
+
+
 def _contribution_dict(contribution: Contribution) -> dict[str, Any]:
     return {
         "value": contribution.value,
@@ -232,6 +255,7 @@ def _contribution_dict(contribution: Contribution) -> dict[str, Any]:
         "contribution": contribution.contribution,
         "share_of_deviation": contribution.share_of_deviation,
         "lift": contribution.lift,
+        "meets_lift_gate": _meets_lift_gate(contribution.lift),
         "note": contribution.note,
     }
 
@@ -534,20 +558,34 @@ class AnalysisTools:
 
             lift = share_of_deviation / weight_share
 
-        `share_of_deviation` is how much of the SLICE's total deviation this one
-        value accounts for. `weight_share` is how much of the SLICE's total
-        traffic this one value accounts for. LIFT IS THE SIGNAL TO ACT ON, not
-        `share_of_deviation` alone: a value can carry a huge share of the
-        deviation simply because it is a huge share of the population, while
-        being no more broken than any other value. Lift divides that population-
-        size effect out. Concretely: lift 1.0 means this value explains exactly
-        its own share of the population and is therefore just big, not causal;
-        lift above ~1.5 means the deviation is genuinely concentrated here --
-        this value is meaningfully worse than its size alone would predict, and
-        is worth descending into. Lift below 1.0, or `None` (undefined -- no
-        weight, no baseline, or a single usable value), means this value is NOT
-        where the problem lives, however large its raw share or contribution
-        looks; do not chase it.
+        `lift` and `share_of_deviation` answer DIFFERENT questions, and ranking
+        needs BOTH, in this order -- exactly the criterion the deterministic
+        walker applies (see `continuity.analysis.walk.choose_next_step`):
+
+        1. `lift` is a GATE, not a ranking. It answers "is this value genuinely
+           worse than its size predicts, or is it just big?" Lift ~1.0 means the
+           value explains exactly its own population share and is therefore just
+           big, not causal. Below `continuity.analysis.walk.DEFAULT_MIN_LIFT`
+           (~1.5 -- the SAME threshold the walker gates on, not a second one), or
+           `None` (undefined -- no weight, no baseline, or a single usable
+           value): do not descend into this value, no matter how large its raw
+           share or contribution looks.
+        2. `share_of_deviation` is the RANKING, among values that clear the lift
+           gate. It answers "how much of the problem does this value account
+           for?" Prefer the value with the HIGHEST share.
+
+        THE TRAP, because it is subtle and worth stating explicitly: lift is
+        SCALE-INVARIANT, so a value that is a proportional SUBSET of the true
+        affected population -- e.g. one `os_version` out of several that make up
+        a genuinely-affected `device_type` -- can carry the SAME lift as the
+        broader, true value while its `share_of_deviation` is only a FRACTION of
+        the broader value's (the subset is thinner, so its `weight_share` shrinks
+        by the same factor lift would otherwise be inflated by -- they cancel).
+        Ranking on lift alone picks the narrower subset and understates the
+        incident. `values` below is therefore ranked by `share_of_deviation`
+        DESCENDING among values whose lift clears the gate; values that do not
+        clear it are still returned -- never hidden -- but sorted after every
+        qualifying value, each carrying `meets_lift_gate: false`.
 
         Args:
             slice_json: A JSON object (or JSON-encoded string) of dimension ->
@@ -565,20 +603,27 @@ class AnalysisTools:
                 investigated.
             window_end: ISO-8601 datetime, exclusive end of the window being
                 investigated. Must be after `window_start`.
-            top_n: How many values to return, ranked by contribution (largest
-                first). Default `DEFAULT_TOP_N`. Lower this for a dimension you
-                already expect to have many values (e.g. `title_id`).
+            top_n: How many values to return, ranked by `share_of_deviation`
+                among the values whose lift clears the gate (see above), with
+                non-qualifying values sorted after. Default `DEFAULT_TOP_N`.
+                Lower this for a dimension you already expect to have many
+                values (e.g. `title_id`).
 
         Returns:
             On success, a dict with:
             - `informative`: `False` when this dimension has at most one usable
               value here and therefore cannot explain anything by comparison --
               splitting further on it is pointless.
-            - `values`: up to `top_n` values, ranked by contribution, each with
-              `value`, `metric_value`, `baseline_value`, `weight`,
-              `weight_share`, `contribution`, `share_of_deviation`, `lift`, and
-              `note` (a human-readable explanation whenever a field is `None`,
-              e.g. "absent from the baseline period -- new to this window").
+            - `values`: up to `top_n` values, ranked by `share_of_deviation`
+              descending among values whose lift clears
+              `walk.DEFAULT_MIN_LIFT`, then by `lift` descending among the rest
+              (see the ranking above), each with `value`, `metric_value`,
+              `baseline_value`, `weight`, `weight_share`, `contribution`,
+              `share_of_deviation`, `lift`, `meets_lift_gate` (whether this
+              value's lift cleared the gate -- `False` means it is not worth
+              descending into, however high its share looks), and `note` (a
+              human-readable explanation whenever a field is `None`, e.g.
+              "absent from the baseline period -- new to this window").
             - `values_omitted`: how many further values were left out by the
               `top_n` cutoff. 0 means nothing was omitted -- you are seeing
               every value this dimension has.
@@ -627,7 +672,10 @@ class AnalysisTools:
                 "no_data",
             )
 
-        values, omitted = _truncate(result.values, top_n=top_n)
+        ranked_values = sorted(
+            result.values, key=lambda c: _share_rank_key(c.lift, c.share_of_deviation)
+        )
+        values, omitted = _truncate(ranked_values, top_n=top_n)
         return {
             "slice": _slice_repr(slice_),
             "metric": metric,
@@ -671,10 +719,26 @@ class AnalysisTools:
         suspect a per-title fault.
 
         For each candidate dimension, only its TOP-ranked value (by contribution) is
-        returned, ranked across dimensions by that value's LIFT -- the signal to act on,
-        exactly as `split_on_dimension` explains: lift ~1.0 means a value is just a big
-        population segment, not a cause; lift meaningfully above 1.0 (roughly above 1.5)
-        means it is genuinely worse than its size predicts and worth descending into.
+        returned, and dimensions are ranked across each other exactly as
+        `split_on_dimension` ranks values within one: `lift` GATES, `share_of_deviation`
+        RANKS. `lift` answers "is this value genuinely worse than its size predicts, or
+        is it just big?" -- below `continuity.analysis.walk.DEFAULT_MIN_LIFT` (~1.5, the
+        SAME threshold the deterministic walker gates on), or `None`, do not descend
+        into it regardless of anything else. `share_of_deviation` answers "how much of
+        the problem does this value account for?" -- among dimensions whose top value
+        clears the lift gate, prefer the one with the HIGHEST share.
+
+        THE TRAP: lift is SCALE-INVARIANT, so a dimension whose top value is a
+        proportional SUBSET of the true affected population (e.g. `os_version` sliced
+        out of an already-affected `device_type`) can carry the SAME lift as the
+        broader dimension's top value while explaining only a FRACTION of its
+        share_of_deviation -- the subset is thinner, so its own weight_share shrinks by
+        the same factor that would otherwise inflate its lift, and the two cancel.
+        Ranking by lift alone picks the narrower subset and understates the incident.
+        `dimensions` below is therefore ranked by `share_of_deviation` DESCENDING among
+        dimensions whose top value clears the lift gate; dimensions that do not clear it
+        are still returned -- never hidden -- but sorted after every qualifying one,
+        each carrying `meets_lift_gate: false` to mark it as not worth descending into.
 
         Args:
             slice_json: A JSON object (or JSON-encoded string) of dimension -> value
@@ -692,12 +756,15 @@ class AnalysisTools:
             On success, a dict with:
             - `dimensions`: one entry per candidate dimension (every dimension in
               `topology.DIMENSION_HIERARCHY` not already pinned in `slice_json` --
-              `title_id` is never a candidate here, see above), sorted by `lift`
-              descending (a `None` lift sorts last). Each entry carries `dimension`,
-              `informative` (see `split_on_dimension`), `top_value`, `weight_share`,
-              `share_of_deviation`, `lift`, and `note` (why a field is `None`, or
-              `"no data for this dimension in the window"` when the dimension had no
-              rows at all here).
+              `title_id` is never a candidate here, see above), sorted by
+              `share_of_deviation` descending among dimensions whose top value's lift
+              clears `walk.DEFAULT_MIN_LIFT`, then by `lift` descending among the rest
+              (see the ranking above). Each entry carries `dimension`, `informative`
+              (see `split_on_dimension`), `top_value`, `weight_share`,
+              `share_of_deviation`, `lift`, `meets_lift_gate` (`False` means this
+              dimension's top value is not worth descending into, however high its
+              share looks), and `note` (why a field is `None`, or `"no data for this
+              dimension in the window"` when the dimension had no rows at all here).
             - `sql`, `baseline_sql`: the one batched query (per window) behind every
               dimension's result -- all dimensions share the same two queries, so this
               is not repeated per dimension.
@@ -752,6 +819,7 @@ class AnalysisTools:
         for dimension in candidate_dimensions:
             result = results[dimension]
             top = result.values[0] if result.values else None
+            top_lift = top.lift if top is not None else None
             ranked.append(
                 {
                     "dimension": dimension,
@@ -759,7 +827,8 @@ class AnalysisTools:
                     "top_value": top.value if top is not None else None,
                     "weight_share": top.weight_share if top is not None else None,
                     "share_of_deviation": top.share_of_deviation if top is not None else None,
-                    "lift": top.lift if top is not None else None,
+                    "lift": top_lift,
+                    "meets_lift_gate": _meets_lift_gate(top_lift),
                     "note": (
                         top.note
                         if top is not None
@@ -768,11 +837,7 @@ class AnalysisTools:
                 }
             )
 
-        def _lift_sort_key(entry: dict[str, Any]) -> tuple[bool, float]:
-            lift = entry["lift"]
-            return (lift is None, -(lift or 0.0))
-
-        ranked.sort(key=_lift_sort_key)
+        ranked.sort(key=lambda entry: _share_rank_key(entry["lift"], entry["share_of_deviation"]))
 
         sample_result = next(iter(results.values()))
         return {

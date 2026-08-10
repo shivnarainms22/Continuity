@@ -103,9 +103,33 @@ async def main() -> int:
             print(f"DETECT found no anomaly windows in {detect_ms:.0f}ms -- nothing to do.")
             return 1
         worst = max(detection.windows, key=lambda w: abs(w.peak_z))
+
+        # Hand the agent the FULL extent of every detected window, not just the single
+        # worst one.
+        #
+        # Handing over one 25-minute peak window cost a real run its answer. On that
+        # narrow a window, os_version=roku_os_13.0 measured lift 4.40 against
+        # device_type=roku at 3.39 -- because roku_os_13.0 is a strict one-third subset
+        # of roku, so it is thinner and noisier, and on thin data noise favours the
+        # narrower slice. Over the full extent it inverts decisively: roku 4.41,
+        # os_version 0.36. The model reasoned correctly about the data it was shown; it
+        # was shown too little of it.
+        #
+        # This also puts the agent on equal footing with the deterministic walker, which
+        # runs against a merged span. Comparing the two on different amounts of evidence
+        # would make the head-to-head meaningless. The agent still calls
+        # refine_incident_span afterwards to recover the fault's true onset and end.
+        span_start = min(w.start for w in detection.windows)
+        span_end = max(w.end for w in detection.windows)
         print(
             f"DETECT ({detect_ms:.0f}ms, no model): {len(detection.windows)} window(s); "
             f"worst {worst.start} .. {worst.end}, peak z {worst.peak_z:.1f}"
+        )
+        print(
+            f"               handing agent the full detected extent "
+            f"{span_start} .. {span_end} "
+            f"({(span_end - span_start).total_seconds() / 3600:.1f}h, "
+            f"vs {(worst.end - worst.start).total_seconds() / 60:.0f}min for the peak alone)"
         )
 
         # --- AGENT: Gemini drives the rest ----------------------------------------
@@ -114,11 +138,12 @@ async def main() -> int:
         runner = InMemoryRunner(agent=pipeline, app_name=APP_NAME)
         session = await runner.session_service.create_session(app_name=APP_NAME, user_id="cli")
 
-        brief_window = (worst.start.isoformat(), worst.end.isoformat())
         prompt = (
             f"A population-level anomaly was detected on metric '{metric}'.\n"
-            f"Anomaly window: {brief_window[0]} to {brief_window[1]}.\n"
-            f"Peak robust z-score at population level: {worst.peak_z:.1f}.\n"
+            f"Anomaly window: {span_start.isoformat()} to {span_end.isoformat()}.\n"
+            f"Within it, {len(detection.windows)} separate burst(s) breached threshold; "
+            f"the worst peaked at robust z {worst.peak_z:.1f} "
+            f"({worst.start.isoformat()} to {worst.end.isoformat()}).\n"
             f"Investigate where this is concentrated and produce the full brief."
         )
 

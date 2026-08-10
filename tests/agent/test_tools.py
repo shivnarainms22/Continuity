@@ -410,9 +410,68 @@ async def test_split_on_dimension_unknown_dimension_is_invalid_input_before_any_
     assert fake.queries == []
 
 
+def _gate_and_share_responses() -> list[QueryResult]:
+    """Three `device_type` values within ONE split: `roku` (lift 2.5, share 0.75 --
+    the broad, true-blast-radius value), `subset` (lift 2.5, share 0.25 -- a
+    proportional THIRD of `roku`'s own weight carrying the identical per-unit
+    deviation ratio, so lift comes out equal by construction), and `bystander`
+    (zero deviation -- lift 0.0, fails the gate outright)."""
+    window_rows = [
+        {"dim": "device_type", "value": "roku", "metric_value": 0.05, "weight": 3000.0},
+        {"dim": "device_type", "value": "subset", "metric_value": 0.05, "weight": 1000.0},
+        {"dim": "device_type", "value": "bystander", "metric_value": 0.01, "weight": 6000.0},
+    ]
+    baseline_rows = [
+        {"dim": "device_type", "value": "roku", "metric_value": 0.01, "weight": 3000.0},
+        {"dim": "device_type", "value": "subset", "metric_value": 0.01, "weight": 1000.0},
+        {"dim": "device_type", "value": "bystander", "metric_value": 0.01, "weight": 6000.0},
+    ]
+    return [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+
+
+async def test_split_on_dimension_prefers_broader_value_over_equal_lift_proportional_subset_trap():
+    """THE TRAP within a single dimension's own values: `subset` is a proportional
+    THIRD of `roku`'s weight carrying the same per-unit deviation ratio, so its
+    lift is IDENTICAL to `roku`'s (lift is scale-invariant) but its
+    share_of_deviation is a third of `roku`'s. `roku` must rank first."""
+    tools = AnalysisTools(_FakeGateway(_gate_and_share_responses()))
+
+    result = await tools.split_on_dimension(
+        {}, "rebuffer", "device_type", _WINDOW_START, _WINDOW_END
+    )
+
+    assert "error" not in result, result
+    by_value = {v["value"]: v for v in result["values"]}
+    roku, subset = by_value["roku"], by_value["subset"]
+
+    assert roku["meets_lift_gate"] is True
+    assert subset["meets_lift_gate"] is True
+    assert roku["lift"] == pytest.approx(subset["lift"], rel=1e-6)
+    assert roku["share_of_deviation"] > subset["share_of_deviation"]
+    assert result["values"][0]["value"] == "roku"
+
+
+async def test_split_on_dimension_sorts_lift_gate_failures_after_qualifying_values():
+    """`bystander` has zero deviation (lift 0.0, fails the gate) and must sort
+    after every value that clears it, even though it is not the smallest raw
+    contribution -- it is marked `meets_lift_gate: False` rather than hidden."""
+    tools = AnalysisTools(_FakeGateway(_gate_and_share_responses()))
+
+    result = await tools.split_on_dimension(
+        {}, "rebuffer", "device_type", _WINDOW_START, _WINDOW_END
+    )
+
+    assert "error" not in result, result
+    values_in_order = [v["value"] for v in result["values"]]
+    assert values_in_order == ["roku", "subset", "bystander"]
+    bystander = next(v for v in result["values"] if v["value"] == "bystander")
+    assert bystander["meets_lift_gate"] is False
+
+
 # ---------------------------------------------------------------------------
 # split_all_dimensions: DEFECT 3 -- every candidate dimension in one call, ranked
-# by lift, excluding whatever is already pinned in the slice.
+# by share_of_deviation among lift-qualifying candidates (lift gates, share ranks),
+# excluding whatever is already pinned in the slice.
 # ---------------------------------------------------------------------------
 
 
@@ -512,6 +571,134 @@ async def test_split_all_dimensions_reports_infrastructure_failure():
     result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
 
     assert result["error_type"] == "infrastructure_failure"
+
+
+def _proportional_subset_trap_responses() -> list[QueryResult]:
+    """Two dimensions, EQUAL lift (4.0), wildly different share_of_deviation:
+
+    `device_type=roku` explains 96% of its own split's deviation (broad, the true
+    blast radius). `os_version=roku_os_14.0` is a proportional THIRD of roku's own
+    weight_share carrying the identical per-unit deviation ratio (delta=0.04, same
+    as roku) -- lift is scale-invariant so it comes out to the exact same 4.0, but
+    it only explains 32% of its own split's deviation. Ranking by lift alone cannot
+    tell these apart; ranking by share_of_deviation (gated on lift) must prefer the
+    broader `device_type` value. Every other candidate dimension carries no rows at
+    all, exactly like `_split_all_responses`.
+    """
+    # os_version's "everything else" is split across FOUR separate sibling values
+    # (not one), each individually smaller in raw contribution than roku_os_14.0's
+    # own -- exactly like the real dataset, where several other OS versions and
+    # device types share the remaining deviation. A single oversized filler value
+    # would itself out-contribute roku_os_14.0 and become the (wrong) top value.
+    window_rows = [
+        {"dim": "device_type", "value": "roku", "metric_value": 0.05, "weight": 2400.0},
+        {
+            "dim": "device_type",
+            "value": "other_dt",
+            "metric_value": 0.0015263157894736855,
+            "weight": 7600.0,
+        },
+        {"dim": "os_version", "value": "roku_os_14.0", "metric_value": 0.05, "weight": 800.0},
+        *(
+            {
+                "dim": "os_version",
+                "value": f"other_os_{i}",
+                "metric_value": 0.008391304347826086,
+                "weight": 2300.0,
+            }
+            for i in range(4)
+        ),
+    ]
+    baseline_rows = [
+        {"dim": "device_type", "value": "roku", "metric_value": 0.01, "weight": 2400.0},
+        {"dim": "device_type", "value": "other_dt", "metric_value": 0.001, "weight": 7600.0},
+        {"dim": "os_version", "value": "roku_os_14.0", "metric_value": 0.01, "weight": 800.0},
+        *(
+            {"dim": "os_version", "value": f"other_os_{i}", "metric_value": 0.001, "weight": 2300.0}
+            for i in range(4)
+        ),
+    ]
+    return [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+
+
+async def test_split_all_dimensions_prefers_broader_value_over_equal_lift_subset_trap():
+    """THE TRAP the ranking fix exists to reject: a proportional subset of the true
+    blast radius has the SAME lift as the broader true value (lift is scale-
+    invariant) but a much SMALLER share_of_deviation. Ranking on lift alone -- the
+    pre-fix behaviour -- picks the subset and understates the incident."""
+    tools = AnalysisTools(_FakeGateway(_proportional_subset_trap_responses()))
+
+    result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert "error" not in result, result
+    device_type = next(d for d in result["dimensions"] if d["dimension"] == "device_type")
+    os_version = next(d for d in result["dimensions"] if d["dimension"] == "os_version")
+
+    assert device_type["meets_lift_gate"] is True
+    assert os_version["meets_lift_gate"] is True
+    # Equal by construction -- lift is scale-invariant.
+    assert device_type["lift"] == pytest.approx(os_version["lift"], rel=1e-6)
+    assert device_type["share_of_deviation"] > os_version["share_of_deviation"]
+
+    # The broader value (device_type=roku) must rank ABOVE the narrower, equally-
+    # concentrated subset (os_version=roku_os_14.0) despite their equal lift.
+    assert result["dimensions"][0]["dimension"] == "device_type"
+    names_in_order = [d["dimension"] for d in result["dimensions"]]
+    assert names_in_order.index("device_type") < names_in_order.index("os_version")
+
+
+async def test_split_all_dimensions_ranks_by_share_not_by_lift_among_qualifying_candidates():
+    """Two dimensions both clear the lift gate; the one with the LOWER lift but
+    HIGHER share_of_deviation must rank first -- proving share_of_deviation, not
+    lift, is the primary sort key once the gate has already been cleared."""
+    # cdn's "everything else" is split across FIVE separate sibling values, each
+    # individually smaller in raw contribution than cdn_northwind's own -- see the
+    # comment on `_proportional_subset_trap_responses` for why a single oversized
+    # filler would wrongly become the top value instead.
+    window_rows = [
+        # device_type: lift 2.0, share 0.8 -- lower lift, higher share.
+        {"dim": "device_type", "value": "roku", "metric_value": 0.05, "weight": 4000.0},
+        {
+            "dim": "device_type",
+            "value": "other_dt",
+            "metric_value": 0.007666666666666667,
+            "weight": 6000.0,
+        },
+        # cdn: lift 5.0, share 0.2 -- higher lift, lower share.
+        {"dim": "cdn", "value": "cdn_northwind", "metric_value": 0.06, "weight": 400.0},
+        *(
+            {
+                "dim": "cdn",
+                "value": f"other_cdn_{i}",
+                "metric_value": 0.009333333333333333,
+                "weight": 1920.0,
+            }
+            for i in range(5)
+        ),
+    ]
+    baseline_rows = [
+        {"dim": "device_type", "value": "roku", "metric_value": 0.01, "weight": 4000.0},
+        {"dim": "device_type", "value": "other_dt", "metric_value": 0.001, "weight": 6000.0},
+        {"dim": "cdn", "value": "cdn_northwind", "metric_value": 0.01, "weight": 400.0},
+        *(
+            {"dim": "cdn", "value": f"other_cdn_{i}", "metric_value": 0.001, "weight": 1920.0}
+            for i in range(5)
+        ),
+    ]
+    responses = [_qr(window_rows)] + [_qr(baseline_rows) for _ in range(4)]
+    tools = AnalysisTools(_FakeGateway(responses))
+
+    result = await tools.split_all_dimensions({}, "rebuffer", _WINDOW_START, _WINDOW_END)
+
+    assert "error" not in result, result
+    device_type = next(d for d in result["dimensions"] if d["dimension"] == "device_type")
+    cdn = next(d for d in result["dimensions"] if d["dimension"] == "cdn")
+
+    assert device_type["lift"] == pytest.approx(2.0, rel=1e-3)
+    assert cdn["lift"] == pytest.approx(5.0, rel=1e-3)
+    assert device_type["lift"] < cdn["lift"]  # device_type has the LOWER lift ...
+    assert device_type["share_of_deviation"] > cdn["share_of_deviation"]  # ... but higher share
+    assert result["dimensions"][0]["dimension"] == "device_type"  # ... and must rank first
 
 
 # ---------------------------------------------------------------------------
