@@ -29,9 +29,16 @@ from pathlib import Path
 import pytest
 
 from continuity.analysis.baseline import DEFAULT_LOOKBACK_WEEKS
-from continuity.analysis.detect import detect
+from continuity.analysis.detect import (
+    build_series_sql,
+    detect,
+    detect_from_series,
+    fetch_window_start,
+)
+from continuity.analysis.metrics import get_metric
 from continuity.analysis.slices import Slice
 from continuity.data.load import WINDOW_START as DATASET_START
+from continuity.gateway.mcp_gateway import QueryError
 
 pytestmark = pytest.mark.integration
 
@@ -168,3 +175,92 @@ async def test_whole_population_quiet_period_produces_zero_anomaly_windows(gatew
     assert result.windows == []
     assert result.total_buckets == 1440  # 5 days * 288 five-minute buckets/day
     assert result.unknown_fraction == pytest.approx(0.0)
+
+
+# --- (e) the fetch restriction: same results, far fewer rows -----------------------
+
+
+def _parse_bucket(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
+async def _detect_full_contiguous_range(gateway, slice_, metric_name, start, end):
+    """Mirrors `detect()`'s PRE-FIX body exactly: the whole contiguous history range
+    back to `DEFAULT_LOOKBACK_WEEKS` ago, via `build_series_sql`'s `extra_buckets=None`
+    default -- the shape every other caller (report_schema.py, cli.py) still uses.
+    Used only as the "before" side of the behaviour-preservation guard below.
+    """
+    metric = get_metric(metric_name)
+    fetch_start = fetch_window_start(start, DEFAULT_LOOKBACK_WEEKS * 7)
+    sql = build_series_sql(slice_, metric, fetch_start, end)
+    result = await gateway.query(sql)
+    observations = [(_parse_bucket(row["bucket"]), row["value"]) for row in result.rows]
+    return detect_from_series(
+        observations, slice_=slice_, metric_name=metric_name, start=start, end=end, sql=sql
+    )
+
+
+def _windows_signature(result):
+    return [
+        (w.start, w.end, w.peak_z, w.peak_value, w.expected_at_peak, w.bucket_count)
+        for w in result.windows
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind, metric_name, pad_hours",
+    [
+        ("device_app_fault", "rebuffer", 6),
+        ("encode_fault", "bitrate", 3),
+        ("decoy_premiere", "rebuffer", 6),
+        # INC-POP-NW-ATL-2: the incident actually observed hitting
+        # MEMORY_LIMIT_EXCEEDED under the old full-contiguous-range fetch.
+        ("pop_fault", "startup", 6),
+    ],
+)
+async def test_restricted_history_fetch_matches_full_contiguous_fetch_exactly(
+    gateway, kind, metric_name, pad_hours
+):
+    """The behaviour-preservation guard this whole fix rests on: restricting the history
+    fetch to `baseline.required_history_buckets`'s output -- rather than the whole
+    contiguous range back to `DEFAULT_LOOKBACK_WEEKS` ago -- must produce byte-identical
+    anomaly windows and peak z-scores, for every real planted incident. A faster query
+    that changes results would be a regression, not a fix.
+
+    Also proves the restriction is real, not a no-op: the new query must read
+    substantially fewer rows than the old full-range one, and its SQL must show the
+    explicit bucket list rather than only a wide contiguous range.
+    """
+    incident = _by_kind(kind)
+    true_start, true_end = _window(incident)
+    slice_ = _slice_for(incident)
+    start = true_start - timedelta(hours=pad_hours)
+    end = true_end + timedelta(hours=pad_hours)
+
+    # The restricted fetch is the whole point of the fix: it must never hit the
+    # ClickHouse memory limit the old full-contiguous-range fetch was observed to hit.
+    new = await detect(gateway, slice_, metric_name, start, end)
+    assert "bucket IN (" in new.sql or "toStartOfFiveMinute(event_time) IN (" in new.sql
+
+    try:
+        old = await _detect_full_contiguous_range(gateway, slice_, metric_name, start, end)
+    except QueryError as exc:
+        if "MEMORY_LIMIT_EXCEEDED" in str(exc):
+            pytest.skip(
+                "old full-contiguous-range fetch hit MEMORY_LIMIT_EXCEEDED on this host "
+                "under current memory pressure -- exactly the bug this fix removes; "
+                "the restricted fetch above already proved it succeeds where the old "
+                "one cannot, so there is nothing left to compare it against."
+            )
+        raise
+
+    assert _windows_signature(new) == _windows_signature(old)
+    assert new.total_buckets == old.total_buckets
+    assert new.anomalous_buckets == old.anomalous_buckets
+    assert new.unknown_buckets == old.unknown_buckets
+
+    old_rows = gateway.query_log[-1].row_count
+    new_rows = gateway.query_log[-2].row_count
+    assert new_rows < old_rows * 0.5, (
+        f"expected the restricted fetch to read far fewer rows: old={old_rows} new={new_rows}"
+    )

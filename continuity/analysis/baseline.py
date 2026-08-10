@@ -51,9 +51,9 @@ for the proof.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 
 import numpy as np
@@ -166,6 +166,22 @@ def select_comparison_window(
     return selected
 
 
+def _lookback_dates(target_date: date, *, lookback_weeks: int) -> list[date]:
+    """Calendar dates exactly `7 * i` days before `target_date`, for `i` in
+    `1..lookback_weeks` -- `target_date`'s own weekday on each of the preceding
+    `lookback_weeks` weeks, excluding `target_date` itself.
+
+    Shared by `select_week_over_week_window`, `select_neighbourhood_residuals` and
+    `required_history_buckets` so all three enumerate the same historical slots by
+    construction -- a second, hand-rolled copy of this arithmetic is exactly what
+    would let the SQL-fetch restriction in detect.py silently drift out of sync with
+    what the baseline actually reads.
+    """
+    if lookback_weeks <= 0:
+        raise ValueError(f"lookback_weeks must be > 0, got {lookback_weeks}")
+    return [target_date - timedelta(weeks=i) for i in range(1, lookback_weeks + 1)]
+
+
 def select_week_over_week_window(
     observations: Sequence[tuple[datetime, float | None]],
     target: datetime,
@@ -185,10 +201,7 @@ def select_week_over_week_window(
     structure: it never mixes weekday observations into a weekend baseline (or vice
     versa), so it cannot manufacture the false positives a trailing-N-days window does.
     """
-    if lookback_weeks <= 0:
-        raise ValueError(f"lookback_weeks must be > 0, got {lookback_weeks}")
-    target_date = target.date()
-    valid_dates = {target_date - timedelta(weeks=i) for i in range(1, lookback_weeks + 1)}
+    valid_dates = set(_lookback_dates(target.date(), lookback_weeks=lookback_weeks))
     selected: list[float] = []
     for ts, value in observations:
         if (ts.hour, ts.minute) != (target.hour, target.minute):
@@ -242,13 +255,12 @@ def select_neighbourhood_residuals(
     residuals: list[float] = []
     for offset in range(-radius, radius + 1):
         slot_target = target + offset * bucket_width
-        slot_date = slot_target.date()
         slot_time = slot_target.time()
         slot_values = [
             by_bucket[dt]
             for dt in (
-                datetime.combine(slot_date - timedelta(weeks=i), slot_time)
-                for i in range(1, lookback_weeks + 1)
+                datetime.combine(d, slot_time)
+                for d in _lookback_dates(slot_target.date(), lookback_weeks=lookback_weeks)
             )
             if dt in by_bucket
         ]
@@ -257,6 +269,43 @@ def select_neighbourhood_residuals(
         slot_median = float(np.median(np.asarray(slot_values, dtype=float)))
         residuals.extend(v - slot_median for v in slot_values)
     return residuals
+
+
+def required_history_buckets(
+    targets: Iterable[datetime],
+    *,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
+    radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
+    bucket_width: timedelta = DEFAULT_BUCKET_WIDTH,
+) -> set[datetime]:
+    """Every historical timestamp `select_week_over_week_window` or
+    `select_neighbourhood_residuals` could read for the given `targets` -- a
+    detection window's own buckets under WEEK_OVER_WEEK.
+
+    A SQL caller (`detect.py::build_series_sql`) fetches the test window's own range
+    in full plus exactly this set, instead of the whole contiguous history range in
+    between -- see detect.py's module docstring for why that range is ~30x bigger
+    than what the baseline ever consumes.
+
+    For each `target`, every one of the `2 * radius + 1` neighbourhood slots
+    (`target +/- k * bucket_width`, `k` in `0..radius`) contributes its own
+    `lookback_weeks` historical dates via `_lookback_dates` -- the `offset == 0` slot
+    IS the LEVEL comparison `select_week_over_week_window` reads, so no separate pass
+    is needed for it. Built from the exact same `_lookback_dates` helper those two
+    selection functions use, so this enumeration cannot silently diverge from what
+    they actually select -- the trap called out in the task: under-covering here would
+    turn OK baselines into INSUFFICIENT_DATA rather than raising anything visible.
+    """
+    if radius < 0:
+        raise ValueError(f"radius must be >= 0, got {radius}")
+    needed: set[datetime] = set()
+    for target in targets:
+        for offset in range(-radius, radius + 1):
+            slot_target = target + offset * bucket_width
+            slot_time = slot_target.time()
+            for d in _lookback_dates(slot_target.date(), lookback_weeks=lookback_weeks):
+                needed.add(datetime.combine(d, slot_time))
+    return needed
 
 
 def compute_baseline(

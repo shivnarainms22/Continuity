@@ -26,6 +26,7 @@ from continuity.analysis.baseline import (
     Direction,
     compute_baseline,
     is_anomalous,
+    required_history_buckets,
     select_week_over_week_window,
 )
 from continuity.analysis.detect import (
@@ -372,6 +373,117 @@ def test_build_series_sql_never_emits_a_bare_count_against_the_rollup():
 def test_fetch_window_start_floors_to_midnight_n_days_before():
     start = fetch_window_start(datetime(2026, 1, 13, 18, 0), trailing_days=7)
     assert start == datetime(2026, 1, 6, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# build_series_sql's extra_buckets: the restricted-history-fetch escape hatch.
+# ---------------------------------------------------------------------------
+
+
+def test_build_series_sql_without_extra_buckets_is_unchanged_full_range_sql():
+    """Default behaviour (extra_buckets=None) must stay byte-identical to the original
+    full-contiguous-range query -- report_schema.py and cli.py still call it this way,
+    and must not be affected by detect()'s own switch to a restricted fetch."""
+    slice_ = Slice().refine("device_type", "roku")
+    sql = build_series_sql(
+        slice_, get_metric("rebuffer"), datetime(2026, 1, 1), datetime(2026, 1, 8)
+    )
+    assert "bucket IN (" not in sql
+    assert (
+        "WHERE (bucket >= '2026-01-01 00:00:00' AND bucket < '2026-01-08 00:00:00') "
+        "AND device_type = 'roku'"
+    ) in sql
+
+
+def test_build_series_sql_with_extra_buckets_adds_an_explicit_in_list_not_a_wider_range():
+    """The fix itself: extra history buckets are fetched by an explicit `IN` list
+    beside the test window's own range, not by widening that range to cover them --
+    the SQL must show buckets from outside [fetch_start, fetch_end) only inside the
+    IN list, never as part of a >= / < comparison."""
+    slice_ = Slice()
+    extra = {datetime(2025, 12, 1, 9, 0), datetime(2025, 12, 8, 9, 0)}
+    sql = build_series_sql(
+        slice_,
+        get_metric("rebuffer"),
+        datetime(2026, 1, 1, 9, 0),
+        datetime(2026, 1, 1, 9, 5),
+        extra_buckets=extra,
+    )
+    assert "bucket IN ('2025-12-01 09:00:00', '2025-12-08 09:00:00')" in sql
+    assert "2026-01-01 09:00:00" in sql
+    assert "2026-01-01 09:05:00" in sql
+
+
+def test_build_series_sql_with_extra_buckets_still_applies_the_slice_predicate_to_both_arms():
+    """Regression guard for an operator-precedence bug: SQL's `AND` binds tighter than
+    `OR`, so `WHERE a OR b AND c` means `a OR (b AND c)` -- if the range/IN-list OR were
+    left unparenthesized against the slice predicate, the contiguous-range arm would
+    silently read the WHOLE population instead of the sliced one. The whole
+    `(range OR extra)` group must be its own parenthesized unit, ANDed with the slice
+    predicate as a whole."""
+    slice_ = Slice().refine("device_type", "roku")
+    extra = {datetime(2025, 12, 1, 9, 0)}
+    sql = build_series_sql(
+        slice_,
+        get_metric("rebuffer"),
+        datetime(2026, 1, 1, 9, 0),
+        datetime(2026, 1, 1, 9, 5),
+        extra_buckets=extra,
+    )
+    assert (
+        "WHERE ((bucket >= '2026-01-01 09:00:00' AND bucket < '2026-01-01 09:05:00') "
+        "OR bucket IN ('2025-12-01 09:00:00')) AND device_type = 'roku'"
+    ) in sql
+
+
+def test_build_series_sql_with_extra_buckets_for_raw_events_matches_on_the_five_minute_bucket():
+    """title_id slices force playback_events, which has no discrete bucket column --
+    the extra-buckets predicate must match on `toStartOfFiveMinute(event_time)`, not
+    the continuous `event_time` itself."""
+    slice_ = Slice().refine("title_id", "1")
+    extra = {datetime(2025, 12, 1, 9, 0)}
+    sql = build_series_sql(
+        slice_,
+        get_metric("bitrate"),
+        datetime(2026, 1, 1, 9, 0),
+        datetime(2026, 1, 1, 9, 5),
+        extra_buckets=extra,
+    )
+    assert "toStartOfFiveMinute(event_time) IN ('2025-12-01 09:00:00')" in sql
+    assert "title_id = 1" in sql
+
+
+def test_build_series_sql_with_an_empty_extra_buckets_set_omits_the_in_clause():
+    """An empty (but non-None) extra_buckets must not emit a dangling `IN ()` -- the
+    query degrades to exactly the plain range clause."""
+    slice_ = Slice()
+    sql = build_series_sql(
+        slice_,
+        get_metric("rebuffer"),
+        datetime(2026, 1, 1),
+        datetime(2026, 1, 2),
+        extra_buckets=set(),
+    )
+    assert "IN (" not in sql
+    assert "WHERE (bucket >= '2026-01-01 00:00:00' AND bucket < '2026-01-02 00:00:00') AND 1" in sql
+
+
+def test_detect_week_over_week_history_fetch_does_not_widen_to_the_full_contiguous_range():
+    """The regression this task exists to prevent: detect()'s WEEK_OVER_WEEK path must
+    build a SQL query restricted to `required_history_buckets`'s output, never the full
+    contiguous range back to `lookback_weeks` ago -- reproduced here purely (no
+    ClickHouse) using the exact building blocks `detect()` itself calls."""
+    start, end = datetime(2026, 2, 12, 12, 0), datetime(2026, 2, 13, 8, 0)  # a 20h window
+    n_buckets = int((end - start) / timedelta(minutes=5))
+    targets = [start + i * timedelta(minutes=5) for i in range(n_buckets)]
+    history = required_history_buckets(targets, lookback_weeks=4, radius=24)
+    sql = build_series_sql(Slice(), get_metric("startup"), start, end, extra_buckets=history)
+
+    # The old full-contiguous-range fetch would start at midnight 28 days before `start`.
+    full_range_start = fetch_window_start(start, 28)
+    assert full_range_start.strftime("%Y-%m-%d %H:%M:%S") not in sql
+    assert "bucket IN (" in sql
+    assert len(history) < len(targets) * 5  # far fewer explicit slots than a naive fetch
 
 
 # ---------------------------------------------------------------------------

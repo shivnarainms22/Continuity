@@ -9,6 +9,7 @@ from continuity.analysis.baseline import (
     Direction,
     compute_baseline,
     is_anomalous,
+    required_history_buckets,
     select_comparison_window,
     select_neighbourhood_residuals,
     select_week_over_week_window,
@@ -225,6 +226,80 @@ def test_select_neighbourhood_residuals_skips_slots_with_no_history():
     observations = _series_at_same_time_of_day([7, 14, 21, 28])  # only offset 0 populated
     residuals = select_neighbourhood_residuals(observations, target, lookback_weeks=4, radius=6)
     assert len(residuals) == 4  # only the offset-0 slot contributed
+
+
+# ---------------------------------------------------------------------------
+# required_history_buckets: exactly what a SQL fetch needs, not a full range.
+# ---------------------------------------------------------------------------
+
+
+def test_required_history_buckets_is_far_smaller_than_the_full_contiguous_range():
+    """The whole point of the fix: for a realistic test window, the history a SQL
+    fetch needs to cover is a small fraction of the full contiguous range between
+    the earliest comparison week and the test window -- not the ~30x-too-much range
+    detect.py used to fetch."""
+    targets = [
+        datetime(2026, 2, 14, 20, 0) + timedelta(minutes=5 * i) for i in range(216)  # 18h window
+    ]
+    history = required_history_buckets(targets, lookback_weeks=4, radius=24)
+
+    full_contiguous_range_bucket_count = (28 + 18 / 24) * 288  # 4 weeks + the window, in buckets
+    assert len(history) < full_contiguous_range_bucket_count / 5
+
+
+def test_required_history_buckets_covers_every_slot_the_selection_functions_read():
+    """No under-coverage: for every target, the union over `required_history_buckets`
+    must include every timestamp `select_week_over_week_window` (the LEVEL) and
+    `select_neighbourhood_residuals` (the SPREAD) could read. Builds a dense synthetic
+    series with a value at every 5-minute slot for 4 weeks back plus the window, then
+    checks that restricting the series to `required_history_buckets` (plus the targets
+    themselves) never changes what either selection function returns."""
+    targets = [datetime(2026, 8, 8, 21, 0) + timedelta(minutes=5 * i) for i in range(12)]
+    lookback_weeks, radius = 4, 24
+
+    dense_observations: list[tuple[datetime, float]] = []
+    start = targets[0] - timedelta(weeks=lookback_weeks, hours=3)
+    end = targets[-1] + timedelta(hours=3)
+    current = start
+    value = 0.0
+    while current <= end:
+        dense_observations.append((current, value))
+        current += timedelta(minutes=5)
+        value += 1.0
+
+    history = required_history_buckets(targets, lookback_weeks=lookback_weeks, radius=radius)
+    restricted = [(ts, v) for ts, v in dense_observations if ts in history or ts in targets]
+
+    for target in targets:
+        full_level = select_week_over_week_window(
+            dense_observations, target, lookback_weeks=lookback_weeks
+        )
+        restricted_level = select_week_over_week_window(
+            restricted, target, lookback_weeks=lookback_weeks
+        )
+        assert sorted(restricted_level) == sorted(full_level)
+
+        full_spread = select_neighbourhood_residuals(
+            dense_observations, target, lookback_weeks=lookback_weeks, radius=radius
+        )
+        restricted_spread = select_neighbourhood_residuals(
+            restricted, target, lookback_weeks=lookback_weeks, radius=radius
+        )
+        assert sorted(restricted_spread) == pytest.approx(sorted(full_spread))
+
+
+def test_required_history_buckets_never_includes_a_target_own_recent_day():
+    """Every enumerated timestamp is at least a week before its target -- the history
+    set is purely historical, never overlapping the test window itself (which a SQL
+    caller fetches separately, via the contiguous range clause)."""
+    target = datetime(2026, 8, 8, 21, 0)
+    history = required_history_buckets([target], lookback_weeks=4, radius=6)
+    assert all(ts.date() <= target.date() - timedelta(weeks=1) for ts in history)
+
+
+def test_required_history_buckets_rejects_negative_radius():
+    with pytest.raises(ValueError, match="radius"):
+        required_history_buckets([datetime(2026, 8, 8, 21, 0)], radius=-1)
 
 
 def test_select_neighbourhood_residuals_rejects_negative_radius():

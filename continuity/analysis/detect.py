@@ -15,8 +15,19 @@ alone produces false positives on metrics that do vary by weekday.
 
 The maths (`label_buckets`, `group_windows`, `detect_from_series`) is pure and testable
 without Docker. Only `detect()` touches the gateway, and it does so with exactly one
-query: the whole comparison history and the test window are pulled together, per Task
-1's benchmark (a 7-day 5-minute series costs ~41ms).
+query: the test window and its comparison history are pulled together, per Task 1's
+benchmark (a 7-day 5-minute series costs ~41ms).
+
+Under `ComparisonMode.WEEK_OVER_WEEK`, that one query does NOT fetch the whole
+contiguous range between the earliest comparison week and the test window -- only a
+handful of (weekday, time-of-day) slots per test bucket are ever read by
+`select_week_over_week_window` / `select_neighbourhood_residuals` (baseline.py), so
+fetching the full range in between reads roughly 30x more rows than the baseline uses
+and was the direct cause of repeated ClickHouse `MEMORY_LIMIT_EXCEEDED` failures on
+wide test windows. `build_series_sql`'s `extra_buckets` restricts the history portion
+to exactly `baseline.required_history_buckets`'s output -- the same enumeration the
+baseline itself reads from, so the two cannot drift apart. `ComparisonMode.TRAILING_DAYS`
+still fetches its full contiguous range; it has no comparable narrow-slot structure.
 
 Buckets whose baseline could not be computed (`BaselineStatus.INSUFFICIENT_DATA`) are
 UNKNOWN, never silently folded into "normal" -- `DetectionResult.unknown_fraction` lets a
@@ -25,7 +36,7 @@ caller see when too much of a slice is unmeasurable to trust a quiet result.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -41,6 +52,7 @@ from continuity.analysis.baseline import (
     Direction,
     compute_baseline,
     is_anomalous,
+    required_history_buckets,
     select_comparison_window,
     select_neighbourhood_residuals,
     select_week_over_week_window,
@@ -175,29 +187,57 @@ def fetch_window_start(start: datetime, trailing_days: int = DEFAULT_TRAILING_DA
     return datetime.combine(start.date() - timedelta(days=trailing_days), datetime.min.time())
 
 
+def _bucket_literal(ts: datetime) -> str:
+    return f"'{ts.strftime('%Y-%m-%d %H:%M:%S')}'"
+
+
 def build_series_sql(
-    slice_: Slice, metric: Metric, fetch_start: datetime, fetch_end: datetime
+    slice_: Slice,
+    metric: Metric,
+    fetch_start: datetime,
+    fetch_end: datetime,
+    *,
+    extra_buckets: Iterable[datetime] | None = None,
 ) -> str:
-    """The single query that fetches the whole (trailing baseline + test window) series.
+    """The single query that fetches the test-window-plus-comparison-history series.
 
     One `GROUP BY bucket` query, not one query per bucket -- see the module docstring.
+
+    `[fetch_start, fetch_end)` is always fetched in full. `extra_buckets`, if given,
+    adds an explicit set of additional bucket timestamps rather than widening that
+    range to cover them -- see `detect()`'s WEEK_OVER_WEEK path, which passes
+    `baseline.required_history_buckets`'s output here instead of the whole contiguous
+    history range, because week-over-week only ever reads a handful of specific
+    (weekday, time-of-day) slots. When `extra_buckets` is `None` (the default) the
+    query is exactly the original full contiguous range -- every other caller
+    (report_schema.py, cli.py) is unaffected.
     """
     raw_events = slice_.requires_raw_events
     expr = metric.sql_for(raw_events=raw_events)
     where = slice_.where_sql()
     start_literal = fetch_start.strftime("%Y-%m-%d %H:%M:%S")
     end_literal = fetch_end.strftime("%Y-%m-%d %H:%M:%S")
+    extras = sorted(set(extra_buckets)) if extra_buckets is not None else []
+    extras_literal = ", ".join(_bucket_literal(ts) for ts in extras)
     if raw_events:
+        range_predicate = f"event_time >= '{start_literal}' AND event_time < '{end_literal}'"
+        if extras:
+            range_predicate = (
+                f"({range_predicate}) OR toStartOfFiveMinute(event_time) IN ({extras_literal})"
+            )
         return (
             f"SELECT toStartOfFiveMinute(event_time) AS bucket, {expr} AS value "
             f"FROM playback_events "
-            f"WHERE event_time >= '{start_literal}' AND event_time < '{end_literal}' "
+            f"WHERE ({range_predicate}) "
             f"AND {where} "
             f"GROUP BY bucket ORDER BY bucket"
         )
+    range_predicate = f"bucket >= '{start_literal}' AND bucket < '{end_literal}'"
+    if extras:
+        range_predicate = f"({range_predicate}) OR bucket IN ({extras_literal})"
     return (
         f"SELECT bucket, {expr} AS value FROM qoe_rollup_5m "
-        f"WHERE bucket >= '{start_literal}' AND bucket < '{end_literal}' "
+        f"WHERE ({range_predicate}) "
         f"AND {where} "
         f"GROUP BY bucket ORDER BY bucket"
     )
@@ -437,11 +477,23 @@ async def detect(
     neighbourhood_radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
 ) -> DetectionResult:
     """Fetch the series through the MCP gateway (one query) and detect anomaly windows
-    over [start, end). This is the only function in this module that performs I/O."""
+    over [start, end). This is the only function in this module that performs I/O.
+
+    Under WEEK_OVER_WEEK, the query fetches [start, end) in full plus exactly the
+    comparison-history buckets `required_history_buckets` says the baseline will read
+    -- not the whole contiguous range back to `lookback_weeks` ago (see the module
+    docstring). TRAILING_DAYS keeps fetching its full contiguous range unchanged.
+    """
     metric = get_metric(metric_name)
-    days_of_history = trailing_days if mode is ComparisonMode.TRAILING_DAYS else lookback_weeks * 7
-    fetch_start = fetch_window_start(start, days_of_history)
-    sql = build_series_sql(slice_, metric, fetch_start, end)
+    if mode is ComparisonMode.WEEK_OVER_WEEK:
+        targets = _bucket_range(start, end)
+        history_buckets = required_history_buckets(
+            targets, lookback_weeks=lookback_weeks, radius=neighbourhood_radius
+        )
+        sql = build_series_sql(slice_, metric, start, end, extra_buckets=history_buckets)
+    else:
+        fetch_start = fetch_window_start(start, trailing_days)
+        sql = build_series_sql(slice_, metric, fetch_start, end)
     result = await gateway.query(sql)
     observations = [(_parse_bucket(row["bucket"]), row["value"]) for row in result.rows]
     return detect_from_series(
