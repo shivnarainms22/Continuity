@@ -1,0 +1,502 @@
+{
+  "generated_at": "2026-08-10T13:41:50.643136",
+  "agent_model": "gemini-3.6-flash",
+  "agent_skipped": false,
+  "incidents": [
+    {
+      "incident_id": "INC-APP-ROKU-820",
+      "kind": "device_app_fault",
+      "is_decoy": false,
+      "true_predicate": {
+        "device_type": "roku",
+        "app_version": "8.2.0"
+      },
+      "true_change_id": "1",
+      "reference_impact": {
+        "slice": {
+          "device_type": "roku",
+          "app_version": "8.2.0"
+        },
+        "metric": "rebuffer",
+        "window_start": "2026-02-12T18:00:00",
+        "window_end": "2026-02-13T02:00:00",
+        "typical_severity_ratio": 3.5125637403159637,
+        "peak_severity_ratio": 10.021268212050032,
+        "affected_subscribers": 3689,
+        "arr_at_risk_low": "21666.32",
+        "arr_at_risk_expected": "36110.53",
+        "arr_at_risk_high": "50554.75",
+        "methodology": {
+          "base_monthly_churn": "0.025",
+          "base_churn_variation": "0.40",
+          "tenure_multiplier_at_signup": "2.0",
+          "tenure_multiplier_floor": "0.5",
+          "tenure_half_life_days": "180",
+          "severity_multiplier_max": "3.0",
+          "severity_sessions_half_saturation": "5",
+          "severity_qoe_half_saturation": "2.0",
+          "churn_risk_ceiling": "1.0",
+          "qoe_delta_ratio": "3.5125637403159637",
+          "affected_subscriber_count": 3689,
+          "notes": "Heuristic, not a trained model. churn_risk = base_monthly_churn * tenure_multiplier(tenure_days) * severity_multiplier(sessions_affected, qoe_delta_ratio), capped at churn_risk_ceiling. arr_at_risk = sum over affected subscribers of churn_risk * monthly_arpu * 12. The low/expected/high band comes from scaling base_monthly_churn by +/-base_churn_variation -- every other coefficient is held fixed across the band. Every coefficient is a documented assumption, not a measurement from this dataset."
+        },
+        "sql": "SELECT subscribers.subscriber_id AS subscriber_id, subscribers.tenure_days AS tenure_days, toString(subscribers.monthly_arpu) AS monthly_arpu, affected.sessions_affected AS sessions_affected FROM (SELECT subscriber_id, uniqExact(session_id) AS sessions_affected FROM playback_events WHERE device_type = 'roku' AND app_version = '8.2.0' AND event_time >= '2026-02-12 18:00:00' AND event_time < '2026-02-13 02:00:00' GROUP BY subscriber_id) AS affected INNER JOIN subscribers ON subscribers.subscriber_id = affected.subscriber_id",
+        "severity_sql": "SELECT bucket, sum(rebuffer_ms) / nullIf(sum(watched_ms), 0) AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-15 00:00:00' AND bucket < '2026-02-13 01:55:00' AND device_type = 'roku' AND app_version = '8.2.0' GROUP BY bucket ORDER BY bucket",
+        "detect_sql": "SELECT bucket, sum(rebuffer_ms) / nullIf(sum(watched_ms), 0) AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-15 00:00:00' AND bucket < '2026-02-13 02:00:00' AND device_type = 'roku' AND app_version = '8.2.0' GROUP BY bucket ORDER BY bucket"
+      },
+      "walker": {
+        "incident_id": "INC-APP-ROKU-820",
+        "arm": "walker",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {
+          "device_type": "roku",
+          "app_version": "8.2.0"
+        },
+        "window_start": "2026-02-12T18:10:00",
+        "window_end": "2026-02-13T01:55:00",
+        "stop_reason": "low_lift",
+        "top_change_id": "1",
+        "confidence": null,
+        "affected_subscribers": 3607,
+        "arr_at_risk_low": "21161.17",
+        "arr_at_risk_expected": "35268.61",
+        "arr_at_risk_high": "49376.06",
+        "wall_ms": 40896.475199842826,
+        "model_turns": 0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+        "queries": 68,
+        "note": "deterministic walker -- $0 model cost, no LLM calls"
+      },
+      "agent": {
+        "incident_id": "INC-APP-ROKU-820",
+        "arm": "agent",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {
+          "device_type": "roku",
+          "app_version": "8.2.0"
+        },
+        "window_start": "2026-02-12T18:10:00",
+        "window_end": "2026-02-13T01:55:00",
+        "stop_reason": "low_lift",
+        "top_change_id": "1",
+        "confidence": "high",
+        "affected_subscribers": 3607,
+        "arr_at_risk_low": "21161.17",
+        "arr_at_risk_expected": "35268.61",
+        "arr_at_risk_high": "49376.06",
+        "wall_ms": 142367.77329980396,
+        "model_turns": 12,
+        "prompt_tokens": 127406,
+        "output_tokens": 2091,
+        "total_tokens": 129497,
+        "tool_calls": 8,
+        "queries": 0,
+        "note": "gemini model=gemini-3.6-flash"
+      },
+      "scores": {
+        "walker_blast_radius": {
+          "exact": true,
+          "precision": 1.0,
+          "recall": 1.0,
+          "found": [
+            [
+              "app_version",
+              "8.2.0"
+            ],
+            [
+              "device_type",
+              "roku"
+            ]
+          ],
+          "true": [
+            [
+              "app_version",
+              "8.2.0"
+            ],
+            [
+              "device_type",
+              "roku"
+            ]
+          ]
+        },
+        "agent_blast_radius": {
+          "exact": true,
+          "precision": 1.0,
+          "recall": 1.0,
+          "found": [
+            [
+              "app_version",
+              "8.2.0"
+            ],
+            [
+              "device_type",
+              "roku"
+            ]
+          ],
+          "true": [
+            [
+              "app_version",
+              "8.2.0"
+            ],
+            [
+              "device_type",
+              "roku"
+            ]
+          ]
+        },
+        "walker_attribution_correct": true,
+        "agent_attribution_correct": true,
+        "walker_decoy_flagged": null,
+        "agent_decoy_flagged": null
+      }
+    },
+    {
+      "incident_id": "INC-POP-NW-ATL-2",
+      "kind": "pop_fault",
+      "is_decoy": false,
+      "true_predicate": {
+        "cdn": "cdn_northwind",
+        "pop": "nw-atl-2"
+      },
+      "true_change_id": "2",
+      "reference_impact": {
+        "slice": {
+          "cdn": "cdn_northwind",
+          "pop": "nw-atl-2"
+        },
+        "metric": "startup",
+        "window_start": "2026-02-15T02:00:00",
+        "window_end": "2026-02-15T08:00:00",
+        "typical_severity_ratio": 2.2626825229564957,
+        "peak_severity_ratio": 5.6955426051346665,
+        "affected_subscribers": 1975,
+        "arr_at_risk_low": "10832.04",
+        "arr_at_risk_expected": "18053.40",
+        "arr_at_risk_high": "25274.76",
+        "methodology": {
+          "base_monthly_churn": "0.025",
+          "base_churn_variation": "0.40",
+          "tenure_multiplier_at_signup": "2.0",
+          "tenure_multiplier_floor": "0.5",
+          "tenure_half_life_days": "180",
+          "severity_multiplier_max": "3.0",
+          "severity_sessions_half_saturation": "5",
+          "severity_qoe_half_saturation": "2.0",
+          "churn_risk_ceiling": "1.0",
+          "qoe_delta_ratio": "2.2626825229564957",
+          "affected_subscriber_count": 1975,
+          "notes": "Heuristic, not a trained model. churn_risk = base_monthly_churn * tenure_multiplier(tenure_days) * severity_multiplier(sessions_affected, qoe_delta_ratio), capped at churn_risk_ceiling. arr_at_risk = sum over affected subscribers of churn_risk * monthly_arpu * 12. The low/expected/high band comes from scaling base_monthly_churn by +/-base_churn_variation -- every other coefficient is held fixed across the band. Every coefficient is a documented assumption, not a measurement from this dataset."
+        },
+        "sql": "SELECT subscribers.subscriber_id AS subscriber_id, subscribers.tenure_days AS tenure_days, toString(subscribers.monthly_arpu) AS monthly_arpu, affected.sessions_affected AS sessions_affected FROM (SELECT subscriber_id, uniqExact(session_id) AS sessions_affected FROM playback_events WHERE cdn = 'cdn_northwind' AND pop = 'nw-atl-2' AND event_time >= '2026-02-15 02:00:00' AND event_time < '2026-02-15 08:00:00' GROUP BY subscriber_id) AS affected INNER JOIN subscribers ON subscribers.subscriber_id = affected.subscriber_id",
+        "severity_sql": "SELECT bucket, quantilesTDigestMerge(0.5, 0.95)(startup_q)[2] AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-18 00:00:00' AND bucket < '2026-02-15 08:00:00' AND cdn = 'cdn_northwind' AND pop = 'nw-atl-2' GROUP BY bucket ORDER BY bucket",
+        "detect_sql": "SELECT bucket, quantilesTDigestMerge(0.5, 0.95)(startup_q)[2] AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-18 00:00:00' AND bucket < '2026-02-15 08:00:00' AND cdn = 'cdn_northwind' AND pop = 'nw-atl-2' GROUP BY bucket ORDER BY bucket"
+      },
+      "walker": {
+        "incident_id": "INC-POP-NW-ATL-2",
+        "arm": "walker",
+        "ok": false,
+        "error": "QueryError: ClickHouse rejected the query.\nSQL: SELECT bucket, quantilesTDigestMerge(0.5, 0.95)(startup_q)[2] AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-18 00:00:00' AND bucket < '2026-02-15 08:00:00' AND cdn = 'cdn_northwind' AND pop = 'nw-atl-2' AND app_version = '8.2.0' GROUP BY bucket ORDER BY bucket\nQuery execution failed: Received ClickHouse exception, code: 241, server response: Code: 241. DB::Exception: (total) memory limit exceeded: would use 5.98 GiB (attempt to allocate chunk of 4.56 MiB bytes), current RSS: 1.91 GiB, maximum: 5.97 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker: (while reading column startup_q): (while reading from part /var/lib/clickhouse/store/c46/c4696746-47b9-4a98-a406-d992c2bffbe9/20260213_13899_13915_4/ in table continuity.qoe_rollup_5m (c4696746-47b9-4a98-a406-d992c2bffbe9) located on disk default of type local, from mark 3 with max_rows_to_read = 32768, offset = 0): While executing MergeTreeSelect(pool: ReadPool, algorithm: Thread). (MEMORY_LIMIT_EXCEEDED) (version 25.8.29.51 (official build)) (for url http://localhost:8123)",
+        "skipped": false,
+        "final_slice": {},
+        "window_start": null,
+        "window_end": null,
+        "stop_reason": null,
+        "top_change_id": null,
+        "confidence": null,
+        "affected_subscribers": null,
+        "arr_at_risk_low": null,
+        "arr_at_risk_expected": null,
+        "arr_at_risk_high": null,
+        "wall_ms": 0.0,
+        "model_turns": 0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+        "queries": 0,
+        "note": ""
+      },
+      "agent": {
+        "incident_id": "INC-POP-NW-ATL-2",
+        "arm": "agent",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {
+          "cdn": "cdn_northwind",
+          "pop": "nw-atl-2"
+        },
+        "window_start": "2026-02-15T01:55:00",
+        "window_end": "2026-02-15T08:00:00",
+        "stop_reason": "low_lift",
+        "top_change_id": "2",
+        "confidence": "high",
+        "affected_subscribers": 2011,
+        "arr_at_risk_low": "11013.90",
+        "arr_at_risk_expected": "18356.49",
+        "arr_at_risk_high": "25699.09",
+        "wall_ms": 127159.52010010369,
+        "model_turns": 11,
+        "prompt_tokens": 125787,
+        "output_tokens": 2195,
+        "total_tokens": 127982,
+        "tool_calls": 7,
+        "queries": 0,
+        "note": "gemini model=gemini-3.6-flash"
+      },
+      "scores": {
+        "walker_blast_radius": null,
+        "agent_blast_radius": {
+          "exact": true,
+          "precision": 1.0,
+          "recall": 1.0,
+          "found": [
+            [
+              "cdn",
+              "cdn_northwind"
+            ],
+            [
+              "pop",
+              "nw-atl-2"
+            ]
+          ],
+          "true": [
+            [
+              "cdn",
+              "cdn_northwind"
+            ],
+            [
+              "pop",
+              "nw-atl-2"
+            ]
+          ]
+        },
+        "walker_attribution_correct": null,
+        "agent_attribution_correct": true,
+        "walker_decoy_flagged": null,
+        "agent_decoy_flagged": null
+      }
+    },
+    {
+      "incident_id": "INC-ENCODE-1",
+      "kind": "encode_fault",
+      "is_decoy": false,
+      "true_predicate": {
+        "title_id": "1"
+      },
+      "true_change_id": "3",
+      "reference_impact": {
+        "slice": {
+          "title_id": "1"
+        },
+        "metric": "bitrate",
+        "window_start": "2026-02-18T09:00:00",
+        "window_end": "2026-02-19T15:00:00",
+        "typical_severity_ratio": 0.545916447120813,
+        "peak_severity_ratio": 0.5632285471537808,
+        "affected_subscribers": 219,
+        "arr_at_risk_low": "995.56",
+        "arr_at_risk_expected": "1659.27",
+        "arr_at_risk_high": "2322.98",
+        "methodology": {
+          "base_monthly_churn": "0.025",
+          "base_churn_variation": "0.40",
+          "tenure_multiplier_at_signup": "2.0",
+          "tenure_multiplier_floor": "0.5",
+          "tenure_half_life_days": "180",
+          "severity_multiplier_max": "3.0",
+          "severity_sessions_half_saturation": "5",
+          "severity_qoe_half_saturation": "2.0",
+          "churn_risk_ceiling": "1.0",
+          "qoe_delta_ratio": "0.545916447120813",
+          "affected_subscriber_count": 219,
+          "notes": "Heuristic, not a trained model. churn_risk = base_monthly_churn * tenure_multiplier(tenure_days) * severity_multiplier(sessions_affected, qoe_delta_ratio), capped at churn_risk_ceiling. arr_at_risk = sum over affected subscribers of churn_risk * monthly_arpu * 12. The low/expected/high band comes from scaling base_monthly_churn by +/-base_churn_variation -- every other coefficient is held fixed across the band. Every coefficient is a documented assumption, not a measurement from this dataset."
+        },
+        "sql": "SELECT subscribers.subscriber_id AS subscriber_id, subscribers.tenure_days AS tenure_days, toString(subscribers.monthly_arpu) AS monthly_arpu, affected.sessions_affected AS sessions_affected FROM (SELECT subscriber_id, uniqExact(session_id) AS sessions_affected FROM playback_events WHERE title_id = 1 AND event_time >= '2026-02-18 09:00:00' AND event_time < '2026-02-19 15:00:00' GROUP BY subscriber_id) AS affected INNER JOIN subscribers ON subscribers.subscriber_id = affected.subscriber_id",
+        "severity_sql": "SELECT toStartOfFiveMinute(event_time) AS bucket, avgIf(bitrate_kbps, event_type = 'heartbeat') AS value FROM playback_events WHERE event_time >= '2026-01-21 00:00:00' AND event_time < '2026-02-19 01:20:00' AND title_id = 1 GROUP BY bucket ORDER BY bucket",
+        "detect_sql": "SELECT toStartOfFiveMinute(event_time) AS bucket, avgIf(bitrate_kbps, event_type = 'heartbeat') AS value FROM playback_events WHERE event_time >= '2026-01-21 00:00:00' AND event_time < '2026-02-19 15:00:00' AND title_id = 1 GROUP BY bucket ORDER BY bucket"
+      },
+      "walker": {
+        "incident_id": "INC-ENCODE-1",
+        "arm": "walker",
+        "ok": false,
+        "error": "QueryError: ClickHouse rejected the query.\nSQL: SELECT bucket, avgMerge(bitrate_avg) AS value FROM qoe_rollup_5m WHERE bucket >= '2026-01-21 00:00:00' AND bucket < '2026-02-19 21:00:00' AND 1 GROUP BY bucket ORDER BY bucket\nQuery execution failed: Received ClickHouse exception, code: 241, server response: Code: 241. DB::Exception: (total) memory limit exceeded: would use 5.97 GiB (attempt to allocate chunk of 0.00 B bytes), current RSS: 2.60 GiB, maximum: 5.97 GiB. OvercommitTracker decision: Query was selected to stop by OvercommitTracker: While executing AggregatingTransform. (MEMORY_LIMIT_EXCEEDED) (version 25.8.29.51 (official build)) (for url http://localhost:8123)",
+        "skipped": false,
+        "final_slice": {},
+        "window_start": null,
+        "window_end": null,
+        "stop_reason": null,
+        "top_change_id": null,
+        "confidence": null,
+        "affected_subscribers": null,
+        "arr_at_risk_low": null,
+        "arr_at_risk_expected": null,
+        "arr_at_risk_high": null,
+        "wall_ms": 0.0,
+        "model_turns": 0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+        "queries": 0,
+        "note": ""
+      },
+      "agent": {
+        "incident_id": "INC-ENCODE-1",
+        "arm": "agent",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {
+          "region": "us_northeast",
+          "cdn": "cdn_solstice",
+          "device_type": "lg_tv"
+        },
+        "window_start": "2026-02-18T14:10:00",
+        "window_end": "2026-02-19T08:25:00",
+        "stop_reason": "max_depth",
+        "top_change_id": null,
+        "confidence": "low",
+        "affected_subscribers": 9177,
+        "arr_at_risk_low": "36073.66",
+        "arr_at_risk_expected": "60122.77",
+        "arr_at_risk_high": "84171.88",
+        "wall_ms": 354866.8577999342,
+        "model_turns": 24,
+        "prompt_tokens": 268157,
+        "output_tokens": 3310,
+        "total_tokens": 271467,
+        "tool_calls": 20,
+        "queries": 0,
+        "note": "gemini model=gemini-3.6-flash"
+      },
+      "scores": {
+        "walker_blast_radius": null,
+        "agent_blast_radius": {
+          "exact": false,
+          "precision": 0.0,
+          "recall": 0.0,
+          "found": [
+            [
+              "cdn",
+              "cdn_solstice"
+            ],
+            [
+              "device_type",
+              "lg_tv"
+            ],
+            [
+              "region",
+              "us_northeast"
+            ]
+          ],
+          "true": [
+            [
+              "title_id",
+              "1"
+            ]
+          ]
+        },
+        "walker_attribution_correct": null,
+        "agent_attribution_correct": false,
+        "walker_decoy_flagged": null,
+        "agent_decoy_flagged": null
+      }
+    },
+    {
+      "incident_id": "DECOY-PREMIERE-3",
+      "kind": "decoy_premiere",
+      "is_decoy": true,
+      "true_predicate": {
+        "title_id": "3"
+      },
+      "true_change_id": null,
+      "reference_impact": null,
+      "walker": {
+        "incident_id": "DECOY-PREMIERE-3",
+        "arm": "walker",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {},
+        "window_start": null,
+        "window_end": null,
+        "stop_reason": null,
+        "top_change_id": null,
+        "confidence": null,
+        "affected_subscribers": null,
+        "arr_at_risk_low": null,
+        "arr_at_risk_expected": null,
+        "arr_at_risk_high": null,
+        "wall_ms": 2356.2933998182416,
+        "model_turns": 0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+        "queries": 2,
+        "note": "no incident detected/merged over the search window"
+      },
+      "agent": {
+        "incident_id": "DECOY-PREMIERE-3",
+        "arm": "agent",
+        "ok": true,
+        "error": null,
+        "skipped": false,
+        "final_slice": {},
+        "window_start": null,
+        "window_end": null,
+        "stop_reason": null,
+        "top_change_id": null,
+        "confidence": null,
+        "affected_subscribers": null,
+        "arr_at_risk_low": null,
+        "arr_at_risk_expected": null,
+        "arr_at_risk_high": null,
+        "wall_ms": 2462.17849990353,
+        "model_turns": 0,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "tool_calls": 0,
+        "queries": 0,
+        "note": "DETECT found no anomaly windows -- nothing handed to the agent"
+      },
+      "scores": {
+        "walker_blast_radius": null,
+        "agent_blast_radius": null,
+        "walker_attribution_correct": null,
+        "agent_attribution_correct": null,
+        "walker_decoy_flagged": false,
+        "agent_decoy_flagged": false
+      }
+    }
+  ],
+  "summary": {
+    "walker": {
+      "exact_matches": 1,
+      "of_real_incidents": 3,
+      "skipped": 0,
+      "correct_attributions": 1,
+      "decoys_correctly_ignored": 1,
+      "of_decoys": 1,
+      "errors": 2
+    },
+    "agent": {
+      "exact_matches": 2,
+      "of_real_incidents": 3,
+      "skipped": 0,
+      "correct_attributions": 2,
+      "decoys_correctly_ignored": 1,
+      "of_decoys": 1,
+      "errors": 0
+    }
+  }
+}
