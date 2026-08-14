@@ -64,6 +64,7 @@ from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.workflow import START, RetryConfig, Workflow
+from google.genai import types
 from google.genai.types import HttpRetryOptions
 from mcp import StdioServerParameters
 
@@ -161,6 +162,30 @@ _MCP_READONLY_TOOL_FILTER = ["run_query", "list_tables", "list_databases"]
 # Audit log
 # ---------------------------------------------------------------------------
 
+
+_COMPOSING_STAGE_CONFIG = types.GenerateContentConfig(
+    thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+)
+"""Reduced reasoning for the stages that COMPOSE rather than decide.
+
+Profiled on INC-APP-ROKU-820: 67.9s end to end, of which 67.7s was model time and 0.2s
+was tools -- so latency is round-trips and reasoning, not ClickHouse and not prompt
+size. Time-to-first-token was essentially the entire call (BRIEF: 12,766ms of
+12,767ms), and thinking tokens tracked it turn for turn: the four slowest turns carried
+828-1,456 thought tokens, while ~200-thought turns took 2.4s.
+
+QUANTIFY and BRIEF are where that spend buys nothing. ``quantify_impact`` computes
+every figure and its methodology text is a fixed set of documented assumptions; BRIEF
+is deliberately tool-less and composes prose from three already-decided, already-cited
+stage outputs. Neither chooses anything.
+
+INVESTIGATE and CORRELATE are deliberately NOT given this. Which dimension to descend,
+when the evidence stops improving, which change to believe and what disconfirming
+evidence counts against it -- that is the judgement the agent exists to add over the
+deterministic walker, and it is the thing the head-to-head measures. Making a demo look
+faster by thinking less exactly where the thinking is the product would be trading the
+result for the number that describes it.
+"""
 
 _QUERY_TEXT_MARKER = "[recorded in the audit log at audit_index={index}]"
 
@@ -521,6 +546,7 @@ def build_quantify_agent(
         output_schema=QuantifyResult,
         output_key="quantify_result",
         after_tool_callback=audit_log.after_tool_callback,
+        generate_content_config=_COMPOSING_STAGE_CONFIG,
     )
 
 
@@ -578,6 +604,7 @@ def build_brief_agent(*, model: Model, name: str = "brief") -> LlmAgent:
         tools=[],
         output_schema=BriefResult,
         output_key="brief_result",
+        generate_content_config=_COMPOSING_STAGE_CONFIG,
     )
 
 

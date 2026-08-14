@@ -42,6 +42,7 @@ from google.adk.tools.mcp_tool import McpToolset
 from google.adk.workflow import START, RetryConfig, Workflow
 from google.genai import types
 from google.genai.errors import ClientError
+from google.genai.types import ThinkingLevel
 
 from continuity.agent.agents import (
     CORRELATE_TOOL_NAMES,
@@ -912,6 +913,38 @@ async def test_audit_log_captures_tool_name_arguments_and_sql_in_call_order():
     refine_call = audit_log.entries[1]
     assert refine_call.arguments["approx_start"] == "2026-02-12 12:00:00"
     assert refine_call.sql == "SELECT refine"
+
+
+def _thinking_level(agent) -> ThinkingLevel | None:
+    config = agent.generate_content_config
+    thinking = getattr(config, "thinking_config", None) if config else None
+    return getattr(thinking, "thinking_level", None) if thinking else None
+
+
+def test_composing_stages_think_less_and_judging_stages_are_left_alone(real_tools):
+    """Profiled on INC-APP-ROKU-820: 67.9s, of which 67.7s was model time and 0.2s was
+    tools -- so latency is round-trips and reasoning, not ClickHouse and not prompt size.
+    Time-to-first-token was essentially the whole call (BRIEF: 12,766ms of 12,767ms),
+    and thinking tokens tracked it: BRIEF spent 1,350 and QUANTIFY 506.
+
+    Neither of those stages makes a judgement call. QUANTIFY's tool computes every
+    figure and its methodology text is a fixed set of documented assumptions; BRIEF
+    composes prose from three already-decided, already-cited stage outputs and is
+    deliberately tool-less. Paying deep reasoning there buys nothing.
+
+    INVESTIGATE and CORRELATE are the opposite -- choosing which dimension to descend,
+    when the evidence stops improving, which change to believe and what disconfirming
+    evidence counts against it. That is the judgement the agent exists to provide, so
+    their thinking is deliberately left at the model default. Cutting it there to make
+    a demo look fast would be trading the product's actual value for a number.
+    """
+    pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
+    investigate, correlate, quantify, brief = _stage_nodes(pipeline)
+
+    assert _thinking_level(quantify) is ThinkingLevel.LOW
+    assert _thinking_level(brief) is ThinkingLevel.LOW
+    assert _thinking_level(investigate) is None, "INVESTIGATE is where the judgement is"
+    assert _thinking_level(correlate) is None, "CORRELATE is where the judgement is"
 
 
 class _FakeTool:
