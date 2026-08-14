@@ -147,7 +147,7 @@ async def check_incident_visible(gw, incident: dict) -> None:
     )
 
 
-async def check_decoy(gw, incident: dict) -> None:
+async def check_decoy(gw, incident: dict, dataset_days: int) -> None:
     """The decoy must look like a traffic spike and NOT like a fault.
 
     A system that flags this is producing exactly the false positive that makes real
@@ -177,7 +177,11 @@ async def check_decoy(gw, incident: dict) -> None:
         ).rows[0]
 
     inside, control = await sample(True), await sample(False)
-    days_outside = 20  # control spans the rest of the window; normalise per-day
+    # The control spans every other day in the dataset, so normalise it to a per-day
+    # figure. Derived from ground truth rather than hardcoded: this was pinned at 20 from
+    # when the window was 21 days, and silently understated the ratio by ~2.7x once the
+    # dataset grew to 56 days, failing a check that the data actually satisfied.
+    days_outside = max(dataset_days - 1, 1)
     vol_ratio = inside["sessions"] / max(control["sessions"] / days_outside, 1)
     qoe_ratio = (inside["rebuffer_ratio"] or 0) / max(control["rebuffer_ratio"] or 1e-9, 1e-9)
 
@@ -294,7 +298,7 @@ async def main() -> int:
         print("\nDecoy must NOT look like a fault:")
         for incident in truth["incidents"]:
             if incident["is_decoy"]:
-                await check_decoy(gw, incident)
+                await check_decoy(gw, incident, truth["days"])
 
         print("\nSeasonality must be a real problem:")
         await check_naive_detector_fires_at_night(gw)

@@ -20,6 +20,9 @@ dependencies = [
     "pydantic-settings>=2.6",
     "python-dotenv>=1.0",
     "typer>=0.15",
+    "google-adk[mcp]>=2.6",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
 ]
 
 # NOTE ON AI DEPENDENCIES
@@ -31,6 +34,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",

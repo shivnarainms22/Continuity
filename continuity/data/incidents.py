@@ -64,8 +64,18 @@ def build_incidents(
     INC-APP-ROKU-820 is scoped to device_type=roku AND app_version=8.2.0. Neither
     dimension alone identifies it -- 8.2.0 also ships on firetv/ios/android, and roku
     also runs 8.0.9/8.1.4 -- so a correct investigation must drill down on both.
+
+    Incidents are placed relative to the END of the window (`days` minus a fixed
+    offset), not fixed offsets from the start. `continuity.analysis.baseline`'s default
+    comparison strategy is week-over-week with a 4-week lookback (`DEFAULT_LOOKBACK_WEEKS`):
+    every bucket needs 4 prior samples of its own weekday to produce a baseline at all.
+    The original scheme (fixed offsets of 12/15/18/20 days from the start of a 21-day
+    window) left every incident only 1-2 weeks of prior history -- nowhere near enough.
+    Anchoring to the end instead means every incident keeps the same amount of trailing
+    history regardless of how long `days` grows, as long as `days` is at least the
+    default window length (56 days / 8 weeks, see `continuity.data.load.DEFAULT_DAYS`).
     """
-    app_start = window_start + timedelta(days=12, hours=18)
+    app_start = window_start + timedelta(days=days - 14, hours=18)
     app_incident = PlantedIncident(
         incident_id="INC-APP-ROKU-820",
         kind="device_app_fault",
@@ -85,7 +95,7 @@ def build_incidents(
         ),
     )
 
-    pop_start = window_start + timedelta(days=15, hours=2)
+    pop_start = window_start + timedelta(days=days - 11, hours=2)
     pop_incident = PlantedIncident(
         incident_id="INC-POP-NW-ATL-2",
         kind="pop_fault",
@@ -108,7 +118,7 @@ def build_incidents(
         ),
     )
 
-    encode_start = window_start + timedelta(days=18, hours=9)
+    encode_start = window_start + timedelta(days=days - 8, hours=9)
     encode_incident = PlantedIncident(
         incident_id=f"INC-ENCODE-{encode_title_id}",
         kind="encode_fault",
@@ -131,7 +141,7 @@ def build_incidents(
         ),
     )
 
-    decoy_start = window_start + timedelta(days=20, hours=20)
+    decoy_start = window_start + timedelta(days=days - 6, hours=20)
     decoy_incident = PlantedIncident(
         incident_id=f"DECOY-PREMIERE-{premiere_title_id}",
         kind="decoy_premiere",

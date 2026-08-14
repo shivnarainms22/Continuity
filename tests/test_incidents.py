@@ -13,7 +13,7 @@ from continuity.data.incidents import (
 )
 
 WINDOW_START = datetime(2026, 8, 1, tzinfo=UTC)
-DAYS = 21
+DAYS = 56  # matches continuity.data.load.DEFAULT_DAYS: 4+ prior weeks per incident
 PREMIERE_TITLE_ID = 4001
 ENCODE_TITLE_ID = 4002
 
@@ -64,21 +64,40 @@ def test_roku_820_predicate_is_not_separable_by_either_dimension_alone(incidents
 
 
 def test_incident_windows_are_relative_to_window_start(incidents):
+    """Incidents are anchored to the END of the window (days - offset), not the start --
+    see build_incidents' docstring. This gives every incident at least 4 prior weeks of
+    same-weekday history for the week-over-week baseline, regardless of window length."""
     app = _by_id(incidents, "INC-APP-ROKU-820")
-    assert app.start == WINDOW_START + timedelta(days=12, hours=18)
+    assert app.start == WINDOW_START + timedelta(days=DAYS - 14, hours=18)
     assert app.end == app.start + timedelta(hours=8)
 
     pop = _by_id(incidents, "INC-POP-NW-ATL-2")
-    assert pop.start == WINDOW_START + timedelta(days=15, hours=2)
+    assert pop.start == WINDOW_START + timedelta(days=DAYS - 11, hours=2)
     assert pop.end == pop.start + timedelta(hours=6)
 
     encode = _by_id(incidents, f"INC-ENCODE-{ENCODE_TITLE_ID}")
-    assert encode.start == WINDOW_START + timedelta(days=18, hours=9)
+    assert encode.start == WINDOW_START + timedelta(days=DAYS - 8, hours=9)
     assert encode.end == encode.start + timedelta(hours=30)
 
     decoy = _by_id(incidents, f"DECOY-PREMIERE-{PREMIERE_TITLE_ID}")
-    assert decoy.start == WINDOW_START + timedelta(days=20, hours=20)
+    assert decoy.start == WINDOW_START + timedelta(days=DAYS - 6, hours=20)
     assert decoy.end == decoy.start + timedelta(hours=5)
+
+
+def test_every_incident_has_at_least_four_prior_same_weekday_weeks_within_the_window():
+    """The coupled reason incidents moved to end-of-window offsets: with the default
+    week-over-week baseline (K=4 weeks lookback), every incident's start must have at
+    least 4 same-weekday samples strictly before it and still inside [window_start,
+    window_start + days)."""
+    incidents = build_incidents(
+        WINDOW_START, DAYS, premiere_title_id=PREMIERE_TITLE_ID, encode_title_id=ENCODE_TITLE_ID
+    )
+    for inc in incidents:
+        earliest_needed = inc.start - timedelta(weeks=4)
+        assert earliest_needed >= WINDOW_START, (
+            f"{inc.incident_id} starts at {inc.start} but only has "
+            f"{(inc.start - WINDOW_START).days // 7} prior weeks within the window"
+        )
 
 
 def test_matches_true_for_full_predicate_match_within_window(incidents):

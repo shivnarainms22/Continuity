@@ -8,7 +8,7 @@ Ground truth (`data/ground_truth.json`) is the only artifact of this module that
 incident truth, and it never reaches ClickHouse (hard constraint 3): the catalog and
 telemetry tables only ever receive the same columns their DDL defines.
 
-Usage: `uv run python -m continuity.data.load --days 21 [--sessions-per-day N] [--truncate]
+Usage: `uv run python -m continuity.data.load --days 56 [--sessions-per-day N] [--truncate]
 [--seed N]`.
 """
 
@@ -40,7 +40,11 @@ from continuity.data.schema import apply_schema
 # same seed to be byte-identical, and a wall-clock default would break that.
 WINDOW_START = datetime(2026, 1, 1, tzinfo=UTC)
 
-DEFAULT_DAYS = 21
+# 56 days (8 weeks): continuity.analysis.baseline's default week-over-week comparison
+# needs 4 prior weeks of the same weekday for every planted incident (see
+# continuity.data.incidents.build_incidents, which anchors incident placement to the
+# END of the window for exactly this reason). --days remains configurable.
+DEFAULT_DAYS = 56
 DEFAULT_SESSIONS_PER_DAY = 250_000
 DEFAULT_SEED = 20260908
 DEFAULT_BATCH_SIZE = 50_000
@@ -174,6 +178,35 @@ def _column_values(batch: dict, column: str) -> list:
     return values.tolist()
 
 
+# Settings applied to bulk inserts only, never to analytical queries.
+#
+# Every insert into playback_events triggers the qoe_rollup_5m materialized view, which
+# runs a nine-dimension GROUP BY whose groups each hold a uniq sketch and a
+# quantilesTDigest sketch. ClickHouse builds one hash table PER AGGREGATION THREAD, so on a
+# many-core machine the view's memory is multiplied by the thread count: loading died with
+# "(total) memory limit exceeded ... would use 5.97 GiB" while resident memory sat under
+# 800 MiB. Capping insert-path threads fixed it.
+#
+# The block-size settings matter for a non-obvious reason: shrinking the client's batch
+# size alone does nothing, because ClickHouse squashes incoming inserts up to
+# min_insert_block_size_rows (default 1,048,576) BEFORE pushing to the view. Capping the
+# squash is what actually bounds the aggregation.
+#
+# These live here rather than in a mounted server config so they travel to ClickHouse Cloud
+# and so they never throttle the drill-down queries, whose latency depends on parallelism.
+#
+# Do NOT add max_bytes_before_external_group_by: enabling the spill made this dramatically
+# worse (failing at 325k rows rather than 65M) because AggregatingTransform reserves
+# against the server total.
+_INSERT_SETTINGS = {
+    "max_threads": 4,
+    "max_insert_threads": 2,
+    "max_insert_block_size": 131072,
+    "min_insert_block_size_rows": 131072,
+    "min_insert_block_size_bytes": 0,
+}
+
+
 def _insert(client, table: str, data: list[tuple], column_names: Sequence[str]) -> int:
     try:
         client.insert(table, data, column_names=list(column_names))
@@ -200,6 +233,7 @@ def _load_playback_events(
             client.insert(
                 "playback_events",
                 columns,
+                settings=_INSERT_SETTINGS,
                 column_names=list(PLAYBACK_EVENTS_COLUMNS),
                 column_oriented=True,
             )
@@ -287,6 +321,17 @@ def run_load(
             encode_title_id=encode_title_id,
         )
 
+        # Ground truth is written BEFORE the bulk load, not after.
+        #
+        # Written last, an interrupted load leaves the PREVIOUS run's ground truth beside
+        # the new run's data. That pairing is silently wrong rather than obviously broken:
+        # anything deriving incident windows from the file looks in the wrong date range,
+        # finds nothing, and reports "no anomalies" -- healthy-looking output from a
+        # corrupt input. Writing it first means an interruption leaves ground truth that
+        # matches the data as far as the data got, and the row counts show the shortfall.
+        progress(f"writing ground truth to {ground_truth_path}...")
+        write_ground_truth(incidents, ground_truth_path, seed=seed, days=days)
+
         progress(f"loading {len(titles)} titles...")
         _insert(client, "titles", _title_rows(titles), _TITLES_COLUMNS)
 
@@ -312,9 +357,6 @@ def run_load(
             batch_size=batch_size,
         )
         _load_playback_events(client, batches, progress)
-
-        progress(f"writing ground truth to {ground_truth_path}...")
-        write_ground_truth(incidents, ground_truth_path, seed=seed, days=days)
 
         row_counts = _row_counts(client, REPORTED_TABLES)
     finally:
