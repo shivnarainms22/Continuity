@@ -914,6 +914,69 @@ async def test_audit_log_captures_tool_name_arguments_and_sql_in_call_order():
     assert refine_call.sql == "SELECT refine"
 
 
+class _FakeTool:
+    """The only thing `after_tool_callback` reads off a tool is its name."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def test_the_model_gets_a_query_reference_instead_of_the_sql_text():
+    """SQL is provenance, not evidence the model reasons over -- and it is enormous.
+
+    Measured on INC-APP-ROKU-820, a single `detect_anomalies` result is 14,555 chars of
+    which 13,465 (93%) is the query text, because restricting the history fetch (5ec7b2a)
+    replaced a contiguous range with an explicit list of 578 bucket literals. That string
+    then sits in the conversation and is re-sent on every later turn. No stage instruction
+    mentions SQL at all; the model cites `audit_index`, which this callback stamps on.
+
+    So the audit log keeps the full text -- provenance is the product's core claim and is
+    untouched -- and the model gets a marker naming where to find it.
+    """
+    audit_log = AuditLog()
+    big_sql = "SELECT bucket FROM qoe_rollup_5m WHERE bucket IN (" + ", ".join(
+        f"'2026-02-{d:02d} 12:00:00'" for d in range(1, 29)
+    ) + ")"
+    result = {
+        "windows": [{"peak_z": 8.1}],
+        "sql": big_sql,
+        "severity_sql": "SELECT severity",
+        "splits": [{"dimension": "device_type", "sql": "SELECT nested", "lift": 4.2}],
+    }
+
+    returned = audit_log.after_tool_callback(
+        tool=_FakeTool("detect_anomalies"), args={"metric": "rebuffer"},
+        tool_context=None, tool_response=result,
+    )
+
+    blob = json.dumps(returned)
+    assert big_sql not in blob, "the full query text still reaches the model"
+    assert "SELECT nested" not in blob, "nested SQL must be stripped too, not just top level"
+    assert "SELECT severity" not in blob
+    assert returned["audit_index"] == 0
+    # Everything that is actually evidence survives untouched.
+    assert returned["windows"] == [{"peak_z": 8.1}]
+    assert returned["splits"][0]["lift"] == 4.2
+    # Provenance is preserved in full, which is the whole point of stripping it above.
+    entry = audit_log.entries[0]
+    assert entry.sql == big_sql
+    assert entry.result["splits"][0]["sql"] == "SELECT nested"
+
+
+def test_stripping_sql_leaves_a_result_with_no_sql_alone():
+    """A tool that returned no SQL (an `invalid_input` / `no_data` error) must pass
+    through unchanged rather than gaining an empty marker."""
+    audit_log = AuditLog()
+    result = {"error": "unknown dimension", "error_type": "invalid_input"}
+
+    returned = audit_log.after_tool_callback(
+        tool=_FakeTool("split_on_dimension"), args={}, tool_context=None, tool_response=result
+    )
+
+    assert returned == {**result, "audit_index": 0}
+    assert audit_log.entries[0].sql is None
+
+
 async def test_correlate_stage_sees_the_investigation_result_via_state_templating():
     """BRIEF and CORRELATE have no tool of their own for reading a prior stage's
     output -- they must receive it through ADK's `{state_key}` instruction

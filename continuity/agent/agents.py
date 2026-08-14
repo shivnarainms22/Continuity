@@ -162,6 +162,50 @@ _MCP_READONLY_TOOL_FILTER = ["run_query", "list_tables", "list_databases"]
 # ---------------------------------------------------------------------------
 
 
+_QUERY_TEXT_MARKER = "[recorded in the audit log at audit_index={index}]"
+
+
+def _without_query_text(value: Any, index: int) -> Any:
+    """`value` with every query-text field replaced by a pointer to the audit log.
+
+    SQL is provenance, not evidence: no stage instruction mentions it, and the model
+    cites an ``audit_index`` rather than a query. But it is by far the largest thing a
+    tool returns -- measured on INC-APP-ROKU-820, one ``detect_anomalies`` result is
+    14,555 characters of which 13,465 (93%) is the query, because restricting the
+    history fetch (5ec7b2a, and the two callers fixed after it) replaced a contiguous
+    range with an explicit list of 578 bucket literals. Every one of those characters
+    then sits in the conversation and is re-sent on every subsequent turn.
+
+    So the model gets a marker and the audit log keeps the text verbatim. Provenance is
+    the product's central claim and is strengthened rather than weakened: a query the
+    model never saw is one it cannot paraphrase, truncate, or invent a variant of.
+
+    Recurses, because ``split_all_dimensions`` and ``find_changes`` carry queries nested
+    inside per-dimension and per-candidate entries -- stripping only the top-level
+    ``sql`` key would leave most of the bulk in place.
+    """
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                _QUERY_TEXT_MARKER.format(index=index)
+                if _is_query_field(key, item)
+                else _without_query_text(item, index)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_without_query_text(item, index) for item in value]
+    return value
+
+
+def _is_query_field(key: Any, item: Any) -> bool:
+    """A non-empty string under a key naming a query (`sql`, `baseline_sql`,
+    `severity_sql`, `detect_sql`). An absent or empty query stays as it is -- an
+    `invalid_input` or `no_data` result legitimately carries none, and replacing that
+    with a pointer would imply a query had run."""
+    return isinstance(key, str) and key.lower().endswith("sql") and isinstance(item, str) and item
+
+
 @dataclass(frozen=True)
 class AuditLogEntry:
     """One tool call: what it was asked, and the SQL its result carried."""
@@ -204,13 +248,18 @@ class AuditLog:
         return index
 
     def after_tool_callback(self, *, tool: Any, args: dict, tool_context: Any, tool_response: Any):
-        """An ADK ``after_tool_callback``: records the call, then hands the model back
-        its own result with ``audit_index`` stamped on -- never a mutated original, ADK
-        callbacks must return a new object or ``None``, never mutate `tool_response` in
-        place (other callbacks may still hold a reference to it)."""
+        """An ADK ``after_tool_callback``: records the call in full, then hands the model
+        back its own result with the query TEXT replaced by a reference and an
+        ``audit_index`` stamped on -- never a mutated original, ADK callbacks must return
+        a new object or ``None``, never mutate `tool_response` in place (other callbacks
+        may still hold a reference to it).
+
+        The log keeps every query verbatim; only the model's copy is trimmed. See
+        ``_without_query_text`` for why.
+        """
         index = self.record(tool_name=tool.name, arguments=args, result=tool_response)
         if isinstance(tool_response, Mapping):
-            return {**tool_response, "audit_index": index}
+            return {**_without_query_text(tool_response, index), "audit_index": index}
         return None
 
 
