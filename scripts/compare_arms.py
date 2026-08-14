@@ -83,6 +83,20 @@ from continuity.gateway.mcp_gateway import ClickHouseMCPGateway
 GROUND_TRUTH = Path("data/ground_truth.json")
 RESULTS_JSON = Path("results/comparison.json")
 DEFAULT_MODEL_ID = "gemini-3.6-flash"
+
+# Seconds to idle between agent investigations. One investigation costs ~215-220k
+# tokens, almost all of it PROMPT tokens (the conversation is re-sent every turn), over
+# ~90s -- so back-to-back investigations sit above a per-minute Vertex token quota and
+# the third one 429s. Measured: it did, in two consecutive runs, on whichever incident
+# happened to be third.
+#
+# The agent's own per-stage retry (continuity.agent.agents.RATE_LIMIT_RETRY) is
+# necessary but not sufficient here, and the reason is worth stating: retrying a STAGE
+# re-runs that stage from its first turn, so each attempt spends tokens again and pushes
+# against the very quota it is waiting on. It rescues a stage that hit a transient
+# limit; it cannot rescue a harness that is structurally over budget. Not overlapping
+# the investigations in the first place is the fix at the right level.
+DEFAULT_PACE_SECONDS = 75.0
 APP_NAME = "continuity_compare"
 
 _SEP = "=" * 78
@@ -857,6 +871,13 @@ async def main() -> int:
         help="Comma-separated incident ids to run (default: every incident in "
         "ground_truth.json).",
     )
+    parser.add_argument(
+        "--pace-seconds",
+        type=float,
+        default=DEFAULT_PACE_SECONDS,
+        help="Seconds to wait between agent investigations so a per-minute Vertex "
+        "token quota can drain (default: %(default)s). 0 disables pacing.",
+    )
     parser.add_argument("--out", default=str(RESULTS_JSON), help="Path for the JSON report.")
     args = parser.parse_args()
 
@@ -885,8 +906,12 @@ async def main() -> int:
         print(f"\nAgent model: {args.model}")
 
     scores: list[IncidentScore] = []
+    pace = 0.0 if args.skip_agent else max(0.0, args.pace_seconds)
     async with ClickHouseMCPGateway(ClickHouseConfig.from_env()) as gateway:
-        for incident in incidents:
+        for index, incident in enumerate(incidents):
+            if pace and index:
+                print(f"\n  ... pacing {pace:.0f}s before the next agent investigation")
+                await asyncio.sleep(pace)
             score = await evaluate_incident(
                 gateway, incident, agent_model=args.model, run_agent=not args.skip_agent
             )

@@ -35,10 +35,11 @@ import json
 import pydantic
 import pytest
 from google.adk.agents import LlmAgent
+from google.adk.models.google_llm import _ResourceExhaustedError
 from google.adk.runners import InMemoryRunner
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
-from google.adk.workflow import START, Workflow
+from google.adk.workflow import START, RetryConfig, Workflow
 from google.genai import types
 from google.genai.errors import ClientError
 
@@ -46,6 +47,7 @@ from continuity.agent.agents import (
     CORRELATE_TOOL_NAMES,
     INVESTIGATE_TOOL_NAMES,
     QUANTIFY_TOOL_NAMES,
+    RATE_LIMIT_RETRY,
     ApprovalRequiredError,
     AuditLog,
     build_brief_agent,
@@ -212,6 +214,125 @@ def test_the_retried_exception_name_still_exists_in_the_installed_adk():
 
     assert _ResourceExhaustedError.__name__ == "_ResourceExhaustedError"
     assert issubclass(_ResourceExhaustedError, ClientError)
+
+
+class _TinyResult(pydantic.BaseModel):
+    value: str
+
+
+class _RateLimitedThenFine(FakeLlm):
+    """Raises a REAL `_ResourceExhaustedError` (the 429 ADK raises) for the first
+    `fail_times` calls, then behaves like a normal `FakeLlm`.
+
+    Constructed from a real `ClientError(429, ...)` rather than a look-alike, because
+    the whole retry hinges on `type(exc).__name__` and a stand-in named the same thing
+    would pass this test while proving nothing about the class ADK actually raises.
+    """
+
+    fail_times: int = 0
+    _failures: int = pydantic.PrivateAttr(default=0)
+
+    @property
+    def failures(self) -> int:
+        return self._failures
+
+    async def generate_content_async(self, llm_request, stream: bool = False):
+        if self._failures < self.fail_times:
+            self._failures += 1
+            raise _ResourceExhaustedError(
+                ClientError(
+                    429,
+                    {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}},
+                    None,
+                )
+            )
+        async for response in super().generate_content_async(llm_request, stream=stream):
+            yield response
+
+
+def _one_stage_workflow(model: FakeLlm, retry: RetryConfig) -> Workflow:
+    """A single-node graph, so the retry under test is the only moving part."""
+    stage = LlmAgent(
+        name="flaky",
+        model=model,
+        instruction="reply with JSON",
+        output_schema=_TinyResult,
+        output_key="tiny_result",
+    )
+    stage.retry_config = retry
+    return Workflow(name="retry_probe", edges=[(START, stage)])
+
+
+async def _run_workflow(pipeline: Workflow) -> str:
+    runner = InMemoryRunner(agent=pipeline, app_name="retry_probe")
+    session = await runner.session_service.create_session(app_name="retry_probe", user_id="u")
+    errors = []
+    async for event in runner.run_async(
+        user_id="u",
+        session_id=session.id,
+        new_message=types.Content(role="user", parts=[types.Part(text="go")]),
+    ):
+        if getattr(event, "error_code", None):
+            errors.append(event.error_code)
+    return errors
+
+
+async def test_a_rate_limited_stage_is_actually_retried_and_then_succeeds():
+    """The behavioural half of the retry: config presence proves nothing on its own --
+    the first version of this fix set `retry_config` on the `Workflow`, satisfied an
+    assertion that it was configured, and retried nothing, because the node runner reads
+    it off the NODE. So drive a stage that raises a real 429 twice and assert the model
+    was called a third time and the run recovered.
+
+    Delays are overridden to ~0 here; the production values are sized for a real
+    per-minute quota window and are asserted separately above.
+    """
+    model = _RateLimitedThenFine(
+        model="fake-flaky",
+        fail_times=2,
+        responses=[scripted_final_text(json.dumps({"value": "recovered"}))],
+    )
+    fast_retry = RetryConfig(
+        max_attempts=RATE_LIMIT_RETRY.max_attempts,
+        initial_delay=0.001,
+        max_delay=0.002,
+        backoff_factor=1.0,
+        jitter=0.0,
+        exceptions=RATE_LIMIT_RETRY.exceptions,
+    )
+
+    await _run_workflow(_one_stage_workflow(model, fast_retry))
+
+    assert model.failures == 2, "expected both rate-limit failures to be exercised"
+    assert model.call_count == 1, "expected the stage to reach the model once it recovered"
+
+
+async def test_a_non_rate_limit_failure_is_not_retried():
+    """The scoping half: a stage that fails for any other reason must fail once, not
+    burn three more full stages' worth of tokens pretending a real defect is a flake.
+    `FakeLlm` raises `AssertionError` when asked for an unscripted turn, so a model
+    scripted with zero responses fails for a reason that is emphatically not a 429.
+    """
+    model = _RateLimitedThenFine(model="fake-broken", fail_times=0, responses=[])
+    pipeline = _one_stage_workflow(
+        model,
+        RetryConfig(
+            max_attempts=4,
+            initial_delay=0.001,
+            max_delay=0.002,
+            exceptions=RATE_LIMIT_RETRY.exceptions,
+        ),
+    )
+
+    # The non-429 failure surfaces rather than being swallowed -- which is the point:
+    # it must reach the caller as a failure, not be quietly retried into a slow one.
+    with pytest.raises(AssertionError, match="only scripted with 0 response"):
+        await _run_workflow(pipeline)
+
+    assert model.call_count == 1, (
+        f"a non-429 failure was retried {model.call_count} times -- retrying broadly "
+        "turns a real defect into an expensive intermittent one"
+    )
 
 
 # ---------------------------------------------------------------------------
