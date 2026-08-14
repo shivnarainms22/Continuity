@@ -279,9 +279,52 @@ class _FakeGateway:
 
     def __init__(self) -> None:
         self.query_log: list = []
+        self.queries: list[str] = []
 
     async def query(self, sql: str) -> _FakeQueryResult:
+        self.queries.append(sql)
         return _FakeQueryResult()
+
+
+def test_refine_incident_severity_query_does_not_fetch_the_whole_history_range(monkeypatch):
+    """The severity re-labelling query runs on the REFINED blast radius -- the narrowest,
+    most-predicated slice in the pipeline -- and was fetching every bucket back to four
+    weeks ago while its week-over-week re-labelling reads only a handful of slots. That
+    is the query observed hitting ClickHouse MEMORY_LIMIT_EXCEEDED and failing the walker
+    arm of the agent comparison on INC-POP-NW-ATL-2. It must fetch history as the explicit
+    bucket list `required_history_buckets` enumerates, like every other series fetch.
+    """
+    slice_ = Slice().refine("device_type", "roku")
+    pop_start = datetime(2026, 2, 12, 19, 40, 0)
+    pop_end = datetime(2026, 2, 12, 20, 15, 0)
+    window = _fake_anomaly_window(pop_start, pop_end)
+    incident = cli_module.MergedIncident(
+        windows=(window,), walks=(_fake_walk_result(slice_, (pop_start, pop_end)),)
+    )
+
+    async def fake_detect(gateway, slice_arg, metric_name, start, end, **kwargs):
+        return cli_module.DetectionResult(
+            slice=slice_arg,
+            metric=metric_name,
+            windows=[],
+            total_buckets=1,
+            anomalous_buckets=0,
+            unknown_buckets=0,
+            sql="SELECT 1",
+        )
+
+    monkeypatch.setattr(cli_module, "detect", fake_detect)
+    fake_gateway = _FakeGateway()
+    asyncio.run(
+        cli_module.refine_incident(
+            fake_gateway, incident, metric_name="rebuffer", refine_padding=timedelta(hours=6)
+        )
+    )
+
+    severity_sql = fake_gateway.queries[-1]
+    assert "bucket IN (" in severity_sql
+    assert "bucket >= '2026-02-12 19:40:00'" in severity_sql
+    assert "bucket >= '2026-01-15 00:00:00'" not in severity_sql  # the pre-fix month-wide range
 
 
 def test_refine_incident_falls_back_to_the_population_span_when_it_finds_nothing(monkeypatch):

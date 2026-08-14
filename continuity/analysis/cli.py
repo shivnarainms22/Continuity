@@ -77,21 +77,14 @@ from statistics import median
 import typer
 from dotenv import load_dotenv
 
-from continuity.analysis.baseline import (
-    DEFAULT_LOOKBACK_WEEKS,
-    DEFAULT_TRAILING_DAYS,
-    ComparisonMode,
-)
 from continuity.analysis.correlate import CorrelationResult, correlate_changes
 from continuity.analysis.detect import (
     BUCKET_WIDTH,
-    DEFAULT_MODE,
     AnomalyWindow,
     BucketStatus,
     DetectionResult,
-    build_series_sql,
+    build_window_series_sql,
     detect,
-    fetch_window_start,
     label_buckets,
 )
 from continuity.analysis.impact import ImpactResult
@@ -390,10 +383,16 @@ async def _typical_and_peak_deviation(
     the module docstring's "WHY SEVERITY IS THE MEDIAN, NOT THE PEAK".
 
     Composes detect.py's own public building blocks exactly as `detect()` itself would
-    (`fetch_window_start`, `build_series_sql`, `label_buckets`, with every default
-    unchanged) rather than trusting each `AnomalyWindow`'s own single recorded peak
-    bucket, which is the ONLY per-bucket figure `DetectionResult` exposes -- getting the
-    typical bucket instead requires re-examining the full series. One extra query.
+    (`build_window_series_sql`, `label_buckets`, with every default unchanged) rather
+    than trusting each `AnomalyWindow`'s own single recorded peak bucket, which is the
+    ONLY per-bucket figure `DetectionResult` exposes -- getting the typical bucket
+    instead requires re-examining the full series. One extra query.
+
+    Fetching through `build_window_series_sql` is what keeps "exactly as `detect()`
+    would" true of the QUERY and not just the labelling: this function assembled its own
+    history range until it was the last caller still pulling a contiguous month, on the
+    narrowest slice in the pipeline, which is what failed the walker with
+    MEMORY_LIMIT_EXCEEDED on INC-POP-NW-ATL-2.
 
     Never empty-handed: if the re-labelling finds no ANOMALOUS bucket at all (a
     parameter-mismatch edge case, not expected in practice since every default here
@@ -402,12 +401,7 @@ async def _typical_and_peak_deviation(
     """
     span_start, span_end = windows[0].start, windows[-1].end
     metric = get_metric(metric_name)
-    days_of_history = (
-        DEFAULT_TRAILING_DAYS if DEFAULT_MODE is ComparisonMode.TRAILING_DAYS
-        else DEFAULT_LOOKBACK_WEEKS * 7
-    )
-    fetch_start = fetch_window_start(span_start, days_of_history)
-    sql = build_series_sql(slice_, metric, fetch_start, span_end)
+    sql = build_window_series_sql(slice_, metric, span_start, span_end)
     result = await gateway.query(sql)
     observations = [(_parse_bucket_datetime(row["bucket"]), row["value"]) for row in result.rows]
     labels = label_buckets(observations, start=span_start, end=span_end, metric=metric)
