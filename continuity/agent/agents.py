@@ -32,12 +32,13 @@ additionally gets a construction-only, read-only ``McpToolset`` escape hatch (se
 
 MODEL SUBSTITUTION. ``google.adk.agents.llm_agent.LlmAgent.model`` is typed
 ``Union[str, BaseLlm]`` -- this is ADK's own supported extension point for swapping the
-model, not a workaround. Every builder function below accepts ``model: str | BaseLlm``
-and passes it straight through, so ``continuity.agent.fake_model.FakeLlm`` (a
-``BaseLlm`` subclass) is a drop-in substitute for the real Gemini model id string in
-every test in this package. Constructing any agent here -- with either a model id
-string or a ``FakeLlm`` -- never imports ``google.genai``'s network client and never
-requires credentials.
+model, not a workaround. Every builder function below accepts ``model: str | BaseLlm``,
+so ``continuity.agent.fake_model.FakeLlm`` (a ``BaseLlm`` subclass) is a drop-in
+substitute for the real Gemini model id string in every test in this package.
+``build_investigation_pipeline`` resolves a model ID through ``resolve_model`` so the
+client it builds carries ``RATE_LIMIT_HTTP_RETRY``; a ``BaseLlm`` passes through
+untouched. Constructing any agent here -- with either form -- never imports
+``google.genai``'s network client and never requires credentials.
 
 AUDIT LOG. ``AuditLog`` is wired onto every tool-bearing agent via ``after_tool_callback``,
 which ADK calls once per tool invocation with the tool, its arguments and its already-
@@ -58,10 +59,12 @@ from typing import Any
 
 from google.adk.agents import LlmAgent
 from google.adk.models.base_llm import BaseLlm
+from google.adk.models.google_llm import Gemini
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.workflow import START, RetryConfig, Workflow
+from google.genai.types import HttpRetryOptions
 from mcp import StdioServerParameters
 
 from continuity.agent.schemas import (
@@ -84,6 +87,33 @@ DEFAULT_MODEL_ID = "gemini-3.6-flash"
 """Matches ``CONTINUITY_MODEL`` in ``.env.example``. Only a fallback -- production
 wiring should pass the configured model explicitly rather than rely on this."""
 
+RATE_LIMIT_HTTP_RETRY = HttpRetryOptions(
+    attempts=6,
+    initial_delay=10.0,
+    max_delay=90.0,
+    exp_base=2.0,
+    http_status_codes=[429],
+)
+"""Retry the individual model REQUEST on HTTP 429, before anything above it notices.
+
+Vertex returns 429 here from shared serving capacity, not from a project quota that
+could be paced around. Measured against this project (`gcloud quotas info describe`,
+aiplatform.googleapis.com): 4,000,000 input tokens/minute, output tokens and per-model
+request rate both unset for `gemini-3.6-flash`. A single investigation is ~216k tokens,
+two orders of magnitude inside that -- and 429s still landed on the FIRST incident of a
+run as readily as the third, which no token budget explains.
+
+So this is contention, it is intermittent, and the fix is patience at the smallest unit
+that can be retried. One re-sent turn costs one turn; `RATE_LIMIT_RETRY` below re-runs
+a whole STAGE from its first turn and re-spends everything that stage had already spent
+-- which is why stage-level retry alone did not rescue a run even after ~105s of
+backoff. Both are kept: this one absorbs the common case, that one is the outer net for
+a sustained outage.
+
+Scoped to status 429 explicitly. The default status list would also retry 5xx, which is
+right for a transport blip but hides a genuinely broken deployment behind six attempts.
+"""
+
 RATE_LIMIT_RETRY = RetryConfig(
     max_attempts=4,
     initial_delay=15.0,
@@ -91,14 +121,17 @@ RATE_LIMIT_RETRY = RetryConfig(
     backoff_factor=2.0,
     exceptions=["_ResourceExhaustedError"],
 )
-"""Retry a stage that hit a Vertex per-minute quota (HTTP 429), and nothing else.
+"""The outer net: retry a whole stage whose 429s outlasted `RATE_LIMIT_HTTP_RETRY`.
 
-One investigation costs roughly 219k tokens across ~11 model turns, so a few run back
-to back exceed a tokens-per-minute quota: two of three incidents failed this way in one
-agent-vs-walker run, and a live demo is equally exposed. A per-minute quota refills on
-its own -- a tiny probe call succeeded minutes after that run -- so waiting is the whole
-fix, and the delays here are sized to span a one-minute quota window rather than the
-sub-second defaults.
+This fires only when a stage kept getting 429 across six request-level attempts spanning
+several minutes -- a sustained capacity problem rather than the intermittent contention
+the request retry above absorbs. Delays are sized in tens of seconds for the same
+reason.
+
+It is deliberately the SECOND line of defence, not the first. Retrying a stage re-runs
+it from its first turn and re-spends every token it had already spent, so it is the
+expensive way to wait; it was the only retry in place for one comparison run and did
+not rescue it even after ~105s of backoff.
 
 Scoped to exactly one exception ON PURPOSE. ADK raises ``_ResourceExhaustedError``
 (``google.adk.models.google_llm``) only for HTTP 429, so this cannot catch another
@@ -517,6 +550,25 @@ def select_tools(tools: Sequence[FunctionTool], names: Sequence[str]) -> list[Fu
     return [by_name[name] for name in names]
 
 
+def resolve_model(model: Model) -> Model:
+    """A model ID becomes a `Gemini` carrying `RATE_LIMIT_HTTP_RETRY`; a `BaseLlm` is
+    returned untouched.
+
+    ADK builds its own `Gemini` from a bare model-id string, with no retry options, so
+    a string that reaches `LlmAgent` unresolved gets a client that abandons the run on
+    the first 429. Resolving it here is the documented way to pass client options
+    (`Gemini.retry_options` feeds `api_client`'s `HttpOptions`) without subclassing or
+    hand-building a client, so tracking headers and endpoint resolution stay ADK's.
+
+    Constructing `Gemini` performs no I/O and reads no credentials -- `api_client` is a
+    `cached_property` evaluated on first real use -- so offline construction still works
+    with no environment at all.
+    """
+    if isinstance(model, str):
+        return Gemini(model=model, retry_options=RATE_LIMIT_HTTP_RETRY)
+    return model
+
+
 def build_investigation_pipeline(
     tools: Sequence[FunctionTool],
     *,
@@ -545,6 +597,7 @@ def build_investigation_pipeline(
     nodes.
     """
     audit_log = AuditLog()
+    model = resolve_model(model)
     investigate = build_investigate_agent(
         select_tools(tools, INVESTIGATE_TOOL_NAMES),
         model=model,

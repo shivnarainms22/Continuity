@@ -35,7 +35,7 @@ import json
 import pydantic
 import pytest
 from google.adk.agents import LlmAgent
-from google.adk.models.google_llm import _ResourceExhaustedError
+from google.adk.models.google_llm import Gemini, _ResourceExhaustedError
 from google.adk.runners import InMemoryRunner
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
@@ -214,6 +214,40 @@ def test_the_retried_exception_name_still_exists_in_the_installed_adk():
 
     assert _ResourceExhaustedError.__name__ == "_ResourceExhaustedError"
     assert issubclass(_ResourceExhaustedError, ClientError)
+
+
+def test_a_string_model_becomes_a_gemini_that_retries_the_request_not_the_stage(real_tools):
+    """Vertex answers 429 from shared serving capacity, not from a project quota we can
+    pace around -- the measured project limits are 4M input tokens/min and no per-model
+    request cap, while a single ~216k-token investigation still 429s intermittently, on
+    the first incident as readily as the third.
+
+    So the retry belongs on the HTTP REQUEST: one turn is re-sent, costing one turn.
+    Retrying the enclosing stage instead re-runs it from its first turn and re-spends
+    every token it had already spent -- which is why the stage-level retry alone did not
+    rescue a run even after ~105s of backoff.
+    """
+    pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
+
+    for stage in _stage_nodes(pipeline):
+        assert isinstance(stage.model, Gemini), (
+            f"{stage.name} kept a bare model id, so no retry options reach the client"
+        )
+        assert stage.model.model == "gemini-3.6-flash"
+        retry = stage.model.retry_options
+        assert retry is not None, f"{stage.name} would fail the whole run on one 429"
+        assert retry.http_status_codes == [429]
+        assert retry.attempts >= 3
+
+
+def test_an_injected_base_llm_is_never_wrapped(real_tools):
+    """Only a model ID needs resolving. A `BaseLlm` -- `FakeLlm` in tests, and any
+    caller-supplied model -- must pass through untouched, or every offline test in this
+    file would start trying to build a real Gemini client."""
+    fake = FakeLlm(model="fake-shared")
+    pipeline, _audit_log = build_investigation_pipeline(real_tools, model=fake)
+
+    assert all(stage.model is fake for stage in _stage_nodes(pipeline))
 
 
 class _TinyResult(pydantic.BaseModel):
