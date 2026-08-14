@@ -108,6 +108,14 @@ export function formatMultiple(value: number): string {
   return `${value.toFixed(1)}x`
 }
 
+/** A robust z-score: a COUNT of deviations from baseline, not a multiple of anything.
+ * Rendering it through `formatMultiple` produced "90.5x robust deviations", which reads
+ * as a ratio and is simply the wrong unit -- the sort of error a careful reader spots
+ * immediately and rightly distrusts the rest of the page for. */
+export function formatZScore(value: number): string {
+  return `${value.toFixed(1)}σ`
+}
+
 // Every naive ISO-8601 timestamp in this dataset is UTC by this project's own
 // convention (see continuity/config.py) -- the backend never appends an offset.
 // `new Date("2026-02-12T18:10:00")` parses a naive string as the *browser's local
@@ -188,4 +196,78 @@ export function formatTime(iso: string): string {
     second: '2-digit',
     timeZone: 'UTC',
   }).format(parseUtc(iso))
+}
+
+/** The human label for one of the agent's tools, for the live measurement trail. */
+export function humanizeToolName(tool: string): string {
+  const labels: Record<string, string> = {
+    detect_anomalies: 'Scanned for anomalies',
+    measure_slice: 'Measured slice',
+    split_on_dimension: 'Split on dimension',
+    split_all_dimensions: 'Split across dimensions',
+    refine_incident_span: 'Refined incident span',
+    find_changes: 'Searched the change log',
+    quantify_impact: 'Quantified impact',
+  }
+  return labels[tool] ?? tool.replace(/_/g, ' ')
+}
+
+/** A one-line finding for a tool call, read from fields the tool actually returned.
+ *
+ * Never computes or infers a figure -- it only selects and formats what is already in
+ * `result`, which is the same rule the agent itself works under. An unrecognised tool
+ * (or a result shape that has moved) yields `null` and the row renders without a
+ * headline rather than with a confident wrong one. */
+export function summarizeToolCall(
+  tool: string,
+  result: Record<string, unknown>,
+): string | null {
+  if (result.error) return String(result.error)
+
+  if (tool === 'split_all_dimensions' || tool === 'split_on_dimension') {
+    const dims = (result.dimensions ?? result.values) as
+      | { dimension?: string; top_value?: string; lift?: number; meets_lift_gate?: boolean }[]
+      | undefined
+    const best = dims?.find((d) => d.meets_lift_gate) ?? dims?.[0]
+    if (!best?.dimension) return null
+    const lift = typeof best.lift === 'number' ? `${formatMultiple(best.lift)} its size` : null
+    const where = best.top_value ? `${best.dimension}=${best.top_value}` : best.dimension
+    return lift ? `${where} explains ${lift}` : where
+  }
+
+  if (tool === 'measure_slice') {
+    const z = result.z
+    const value = result.value
+    if (typeof z !== 'number' || typeof value !== 'number') return null
+    return `${value.toPrecision(3)} · ${formatZScore(Math.abs(z))} from its own baseline`
+  }
+
+  if (tool === 'find_changes') {
+    const candidates = result.candidates as { change_id?: string | number }[] | undefined
+    const rejected = result.rejected as unknown[] | undefined
+    if (!candidates?.length) return `no plausible change found · ${rejected?.length ?? 0} rejected`
+    return `${candidates.length} candidate${candidates.length === 1 ? '' : 's'}, ${rejected?.length ?? 0} rejected`
+  }
+
+  if (tool === 'quantify_impact') {
+    const subs = result.affected_subscribers
+    const arr = result.arr_at_risk_expected
+    if (typeof subs !== 'number') return null
+    return arr ? `${formatCompactNumber(subs)} subscribers · $${arr} ARR at risk` : `${formatCompactNumber(subs)} subscribers`
+  }
+
+  if (tool === 'refine_incident_span') {
+    const start = result.window_start
+    const end = result.window_end
+    if (typeof start !== 'string' || typeof end !== 'string') return null
+    return `true span ${formatDateRange(start, end)}`
+  }
+
+  if (tool === 'detect_anomalies') {
+    const windows = result.windows as unknown[] | undefined
+    if (!windows) return null
+    return `${windows.length} anomaly window${windows.length === 1 ? '' : 's'}`
+  }
+
+  return null
 }

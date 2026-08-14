@@ -5,7 +5,15 @@
 // even with the bug, so this suite must be run with a non-UTC `TZ` (e.g.
 // `TZ=America/Los_Angeles npm run test`) to actually exercise the fix.
 import { describe, expect, it } from 'vitest'
-import { formatDateRange, formatDateTime, formatDuration, formatTime, parseUtc } from './format'
+import {
+  formatDateRange,
+  formatDateTime,
+  formatDuration,
+  formatTime,
+  parseUtc,
+  formatZScore,
+  summarizeToolCall,
+} from './format'
 
 describe('parseUtc', () => {
   it('treats a naive ISO string as UTC, not host-local time', () => {
@@ -56,5 +64,43 @@ describe('formatDateRange', () => {
 describe('formatDuration', () => {
   it('computes elapsed time from the underlying instant, independent of host timezone', () => {
     expect(formatDuration('2026-02-12T18:00:00', '2026-02-13T02:00:00')).toBe('8h')
+  })
+})
+
+describe('summarizeToolCall', () => {
+  it('reads the gated dimension out of a split, not merely the first one', () => {
+    const summary = summarizeToolCall('split_all_dimensions', {
+      dimensions: [
+        { dimension: 'country', top_value: 'us', lift: 1.02, meets_lift_gate: false },
+        { dimension: 'device_type', top_value: 'roku', lift: 4.41, meets_lift_gate: true },
+      ],
+    })
+    expect(summary).toBe('device_type=roku explains 4.4x its size')
+  })
+
+  it('surfaces a tool error as the summary rather than hiding it', () => {
+    expect(summarizeToolCall('measure_slice', { error: 'unknown dimension foo' })).toBe(
+      'unknown dimension foo',
+    )
+  })
+
+  it('says so plainly when find_changes corroborated nothing', () => {
+    expect(summarizeToolCall('find_changes', { candidates: [], rejected: [1, 2] })).toBe(
+      'no plausible change found · 2 rejected',
+    )
+  })
+
+  it('returns null rather than a wrong headline when the shape is unrecognised', () => {
+    expect(summarizeToolCall('split_all_dimensions', { unexpected: true })).toBeNull()
+    expect(summarizeToolCall('some_new_tool', { anything: 1 })).toBeNull()
+  })
+})
+
+describe('formatZScore', () => {
+  it('renders a z-score as deviations, never as a multiple', () => {
+    // "90.5x robust deviations" is the wrong unit -- a z-score counts deviations,
+    // it is not a ratio, and the shipped UI briefly said exactly that.
+    expect(formatZScore(90.5)).toBe('90.5σ')
+    expect(formatZScore(7)).not.toContain('x')
   })
 })

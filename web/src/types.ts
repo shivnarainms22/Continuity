@@ -251,3 +251,77 @@ export interface DoneFrame {
   brief: string
   report: Report
 }
+
+// --- Agent stream (GET /api/investigate/{id}/agent-stream) --------------------
+// The Gemini arm. Where the walker reports one frame per pipeline STAGE, the agent
+// reports one per MEASUREMENT, so the view can show the work as it happens rather
+// than a spinner over a ~45s investigation.
+
+export interface AgentDetectFrame {
+  description: string
+  metric: string
+  windows_found: number
+  span: { start: string; end: string }
+  peak_z: number
+  sql: string
+  elapsed_ms: number
+}
+
+export interface AgentStageFrame {
+  stage: 'investigate' | 'correlate' | 'quantify' | 'brief'
+  label: string
+}
+
+/** One tool call the model chose to make. `audit_index` is the same value a brief
+ * claim cites, which is what lets a figure in the brief link back to the measurement
+ * that produced it. `sql` is the full query text from the audit log. */
+export interface AgentToolCallFrame {
+  audit_index: number
+  tool: string
+  arguments: Record<string, unknown>
+  sql: string | null
+  result: Record<string, unknown>
+  elapsed_ms: number
+}
+
+export interface AgentSliceDimension {
+  dimension: string
+  value: string
+}
+
+export interface AgentDoneFrame {
+  detected: boolean
+  message?: string
+  total_elapsed_ms: number
+  tool_calls?: number
+  investigation?: {
+    hypothesis: string
+    final_slice: AgentSliceDimension[]
+    final_lift: number | null
+    stop_reason: string
+    reasoning: string
+  }
+  correlation?: {
+    confidence: string
+    corroborated: boolean
+    top_candidate_change_id: string | null
+    disconfirming_evidence: string
+    reasoning: string
+  }
+  quantify?: {
+    affected_subscribers: number
+    arr_at_risk_low: string
+    arr_at_risk_expected: string
+    arr_at_risk_high: string
+    methodology_caveat: string
+  }
+  brief?: {
+    summary: string
+    claims: { text: string; source: { tool_name: string; audit_index: number } }[]
+    recommended_action: string
+    methodology_notes: string
+    unresolved: boolean
+  }
+  citations_verified?: boolean
+  citation_error?: string | null
+}
