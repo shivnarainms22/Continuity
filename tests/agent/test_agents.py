@@ -996,6 +996,44 @@ def test_the_model_gets_a_query_reference_instead_of_the_sql_text():
     assert entry.result["splits"][0]["sql"] == "SELECT nested"
 
 
+def test_an_observer_sees_each_tool_call_as_it_happens_not_at_the_end():
+    """The live investigation view streams one frame per measurement the agent makes,
+    which is what makes a ~45s investigation watchable instead of a spinner -- and what
+    puts the ClickHouse queries on screen as they run.
+
+    Reading `entries` after the run is too late for that, so the log notifies an observer
+    at the moment it records. The observer sees the FULL entry, SQL included: the model's
+    copy is trimmed, the audit trail and therefore the UI are not.
+    """
+    seen: list[tuple[str, str | None]] = []
+    audit_log = AuditLog(observer=lambda entry: seen.append((entry.tool_name, entry.sql)))
+
+    audit_log.after_tool_callback(
+        tool=_FakeTool("split_all_dimensions"), args={}, tool_context=None,
+        tool_response={"splits": [], "sql": "SELECT split"},
+    )
+    assert seen == [("split_all_dimensions", "SELECT split")], "observer fired late or not at all"
+
+    audit_log.after_tool_callback(
+        tool=_FakeTool("find_changes"), args={}, tool_context=None,
+        tool_response={"candidates": [], "sql": "SELECT changes"},
+    )
+    assert [name for name, _ in seen] == ["split_all_dimensions", "find_changes"]
+
+
+def test_an_audit_log_with_no_observer_still_records():
+    """The observer is optional -- the CLI paths and every existing test construct an
+    AuditLog without one and must be unaffected."""
+    audit_log = AuditLog()
+
+    audit_log.after_tool_callback(
+        tool=_FakeTool("measure_slice"), args={}, tool_context=None,
+        tool_response={"value": 1, "sql": "SELECT 1"},
+    )
+
+    assert [e.tool_name for e in audit_log.entries] == ["measure_slice"]
+
+
 def test_stripping_sql_leaves_a_result_with_no_sql_alone():
     """A tool that returned no SQL (an `invalid_input` / `no_data` error) must pass
     through unchanged rather than gaining an empty marker."""

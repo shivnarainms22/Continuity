@@ -53,7 +53,7 @@ never one it invents.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -254,6 +254,12 @@ class AuditLog:
 
     entries: list[AuditLogEntry] = field(default_factory=list)
 
+    observer: Callable[[AuditLogEntry], None] | None = None
+    """Notified the moment an entry is recorded, before the tool's result goes back to
+    the model. The live investigation view uses this to stream one frame per measurement
+    as it happens -- reading ``entries`` after the run is too late to show the work being
+    done. Optional: every CLI path constructs an ``AuditLog`` without one."""
+
     def record(
         self, *, tool_name: str, arguments: Mapping[str, Any], result: Mapping[str, Any]
     ) -> int:
@@ -261,15 +267,16 @@ class AuditLog:
         result as ``audit_index`` for the model to cite later."""
         index = len(self.entries)
         sql = result.get("sql") if isinstance(result, Mapping) else None
-        self.entries.append(
-            AuditLogEntry(
-                index=index,
-                tool_name=tool_name,
-                arguments=dict(arguments),
-                sql=sql,
-                result=dict(result) if isinstance(result, Mapping) else {"value": result},
-            )
+        entry = AuditLogEntry(
+            index=index,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            sql=sql,
+            result=dict(result) if isinstance(result, Mapping) else {"value": result},
         )
+        self.entries.append(entry)
+        if self.observer is not None:
+            self.observer(entry)
         return index
 
     def after_tool_callback(self, *, tool: Any, args: dict, tool_context: Any, tool_response: Any):

@@ -27,6 +27,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from continuity.agent.agents import DEFAULT_MODEL_ID
 from continuity.analysis.cli import (
     DEFAULT_GROUND_TRUTH_PATH,
     DEFAULT_MERGE_GAP,
@@ -46,6 +47,7 @@ from continuity.analysis.impact import compute_impact
 from continuity.analysis.slices import Slice
 from continuity.analysis.walk import WalkResult
 from continuity.analysis.walk import walk as run_walk
+from continuity.api.agent_stream import stream_agent_investigation
 from continuity.api.report_schema import (
     fetch_incident_series,
     iso,
@@ -242,6 +244,54 @@ async def stream_investigation(
             "brief": brief,
             "report": structured_report,
         },
+    )
+
+
+@router.get("/{incident_id}/agent-stream")
+async def agent_investigate_stream(incident_id: str, request: Request) -> StreamingResponse:
+    """The Gemini investigation, streamed one measurement at a time.
+
+    Same incident resolution and the same error contract as the walker stream below --
+    the two differ only in which arm runs, which is what lets the UI show them side by
+    side and lets `scripts/compare_arms.py` describe what the product actually does.
+    """
+    gateway: ClickHouseMCPGateway | None = getattr(request.app.state, "gateway", None)
+    if gateway is None:
+        raise HTTPException(status_code=503, detail="ClickHouse gateway is not ready")
+
+    ground_truth_path: Path = getattr(
+        request.app.state, "ground_truth_path", DEFAULT_GROUND_TRUTH_PATH
+    )
+    try:
+        metric_name, window, description = resolve_investigation(
+            metric=None,
+            start=None,
+            end=None,
+            incident=incident_id,
+            ground_truth_path=ground_truth_path,
+        )
+    except InvestigationInputError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    model = getattr(request.app.state, "agent_model", DEFAULT_MODEL_ID)
+
+    async def event_source() -> AsyncIterator[str]:
+        try:
+            async for frame in stream_agent_investigation(
+                gateway,
+                metric_name=metric_name,
+                window=window,
+                description=description,
+                model=model,
+            ):
+                yield frame
+        except QueryError as exc:
+            yield _sse("error", {"message": str(exc)})
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
