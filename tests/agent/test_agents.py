@@ -40,6 +40,7 @@ from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.workflow import START, Workflow
 from google.genai import types
+from google.genai.errors import ClientError
 
 from continuity.agent.agents import (
     CORRELATE_TOOL_NAMES,
@@ -161,6 +162,56 @@ def test_each_stage_has_its_own_typed_output_schema_and_key(real_tools):
         "quantify_result",
     )
     assert (brief.output_schema.__name__, brief.output_key) == ("BriefResult", "brief_result")
+
+
+# ---------------------------------------------------------------------------
+# Construction: retry on a rate-limited model
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_retries_only_on_a_rate_limit_never_on_a_logic_error(real_tools):
+    """A full investigation costs ~219k tokens across ~11 model turns, so a handful of
+    them back to back exhausts a per-minute Vertex quota and returns 429 -- observed
+    failing two of three incidents in one comparison run, and equally capable of killing
+    a live demo. Per-minute quota recovers on its own, so the answer is to wait and
+    retry rather than to fail the investigation.
+
+    The retry must be scoped to exactly that error. Retrying broadly would re-run a
+    stage that failed schema validation or hit a tool bug, quietly tripling the token
+    cost of a real defect and blurring it into a flake.
+
+    The assertion is on the GRAPH NODES, not on the `Workflow`, because that is what
+    the retry actually runs off: `_node_runner` consults `self._node.retry_config`, and
+    a `Workflow`-level `retry_config` does NOT propagate down to the nodes it builds --
+    setting only that one leaves every stage with `retry_config=None` and buys nothing
+    while looking configured.
+    """
+    pipeline, _audit_log = build_investigation_pipeline(real_tools, model="gemini-3.6-flash")
+
+    stages = _stage_nodes(pipeline)
+    assert stages, "expected the pipeline to have stage nodes to check"
+    for stage in stages:
+        retry = stage.retry_config
+        assert retry is not None, f"{stage.name} would abandon the run on a 429"
+        assert retry.exceptions == ["_ResourceExhaustedError"]
+        assert retry.max_attempts >= 3
+        # A per-minute quota window needs a wait on that order to clear.
+        assert retry.max_delay >= 60.0
+
+
+def test_the_retried_exception_name_still_exists_in_the_installed_adk():
+    """`RetryConfig.exceptions` matches on `type(exc).__name__` as a STRING, so the name
+    above is a literal with no import to break if ADK renames or relocates the class --
+    the retry would simply stop happening, silently, and only show up as a demo dying on
+    a 429. This test is the tripwire: it fails loudly on upgrade instead.
+
+    It also pins WHY that name is the right one -- ADK raises it only for HTTP 429, so
+    scoping the retry to it cannot accidentally catch other client errors.
+    """
+    from google.adk.models.google_llm import _ResourceExhaustedError
+
+    assert _ResourceExhaustedError.__name__ == "_ResourceExhaustedError"
+    assert issubclass(_ResourceExhaustedError, ClientError)
 
 
 # ---------------------------------------------------------------------------

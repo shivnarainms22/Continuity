@@ -61,7 +61,7 @@ from google.adk.models.base_llm import BaseLlm
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
-from google.adk.workflow import START, Workflow
+from google.adk.workflow import START, RetryConfig, Workflow
 from mcp import StdioServerParameters
 
 from continuity.agent.schemas import (
@@ -83,6 +83,39 @@ the model."""
 DEFAULT_MODEL_ID = "gemini-3.6-flash"
 """Matches ``CONTINUITY_MODEL`` in ``.env.example``. Only a fallback -- production
 wiring should pass the configured model explicitly rather than rely on this."""
+
+RATE_LIMIT_RETRY = RetryConfig(
+    max_attempts=4,
+    initial_delay=15.0,
+    max_delay=90.0,
+    backoff_factor=2.0,
+    exceptions=["_ResourceExhaustedError"],
+)
+"""Retry a stage that hit a Vertex per-minute quota (HTTP 429), and nothing else.
+
+One investigation costs roughly 219k tokens across ~11 model turns, so a few run back
+to back exceed a tokens-per-minute quota: two of three incidents failed this way in one
+agent-vs-walker run, and a live demo is equally exposed. A per-minute quota refills on
+its own -- a tiny probe call succeeded minutes after that run -- so waiting is the whole
+fix, and the delays here are sized to span a one-minute quota window rather than the
+sub-second defaults.
+
+Scoped to exactly one exception ON PURPOSE. ADK raises ``_ResourceExhaustedError``
+(``google.adk.models.google_llm``) only for HTTP 429, so this cannot catch another
+client error. Retrying more broadly would re-run stages that failed schema validation
+or hit a tool bug -- turning a real defect into an expensive intermittent one, which is
+exactly the diagnosis that stops people looking.
+
+``RetryConfig.exceptions`` matches on ``type(exc).__name__`` as a string, so this is a
+literal with no import to break if ADK renames the class. That would silently disable
+the retry, so ``tests/agent/test_agents.py`` pins the name against the installed ADK.
+
+Applied per NODE. ``Workflow`` also accepts a ``retry_config``, but that governs the
+workflow as a node inside a parent graph and is NOT pushed down into the nodes it
+builds -- ``_node_runner`` reads ``node.retry_config``, so setting only the
+``Workflow`` one leaves every stage with ``None`` and retries nothing while looking
+configured. Measured, not assumed.
+"""
 
 # The MCP server's own read-only tool surface (verified against mcp-clickhouse 0.4.1,
 # see CLAUDE.md). No write-capable tool name is ever listed here, and this filter is a
@@ -525,7 +558,15 @@ def build_investigation_pipeline(
         select_tools(tools, QUANTIFY_TOOL_NAMES), model=model, audit_log=audit_log
     )
     brief = build_brief_agent(model=model)
-    pipeline = Workflow(name=name, edges=[(START, investigate, correlate, quantify, brief)])
+    stages = (investigate, correlate, quantify, brief)
+    for stage in stages:
+        # Per NODE, not on the Workflow: `_node_runner` reads `node.retry_config`, and a
+        # Workflow-level setting does not propagate into the nodes it builds -- it would
+        # leave every stage un-retried while reading as configured. `build_node` clones
+        # each agent without overriding a retry_config it already carries, so this
+        # survives graph construction.
+        stage.retry_config = RATE_LIMIT_RETRY
+    pipeline = Workflow(name=name, edges=[(START, *stages)])
     return pipeline, audit_log
 
 
