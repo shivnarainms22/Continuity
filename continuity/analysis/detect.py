@@ -243,6 +243,42 @@ def build_series_sql(
     )
 
 
+def build_window_series_sql(
+    slice_: Slice,
+    metric: Metric,
+    start: datetime,
+    end: datetime,
+    *,
+    mode: ComparisonMode = DEFAULT_MODE,
+    trailing_days: int = DEFAULT_TRAILING_DAYS,
+    lookback_weeks: int = DEFAULT_LOOKBACK_WEEKS,
+    neighbourhood_radius: int = DEFAULT_NEIGHBOURHOOD_RADIUS,
+) -> str:
+    """The fetch query for [start, end) plus exactly the comparison history `mode`'s
+    baseline will read -- and the ONLY place that decision is made.
+
+    Both callers that need a labelled series over a window (`detect()` here, and
+    `api/report_schema.fetch_incident_series` for the hero chart) route through this,
+    because they previously decided the fetch range independently and drifted apart:
+    `detect()` was fixed to restrict its history fetch while the chart query kept
+    pulling the whole contiguous month, which is the query shape that hit
+    MEMORY_LIMIT_EXCEEDED. Sharing one function makes that divergence unrepresentable.
+
+    Under WEEK_OVER_WEEK the history portion is `required_history_buckets`'s output --
+    the same enumeration the baseline itself reads from, so restriction and selection
+    cannot fall out of step. TRAILING_DAYS reads every bucket in its trailing window,
+    has no narrow-slot structure to exploit, and so keeps its full contiguous range.
+    """
+    if mode is ComparisonMode.WEEK_OVER_WEEK:
+        history_buckets = required_history_buckets(
+            _bucket_range(start, end),
+            lookback_weeks=lookback_weeks,
+            radius=neighbourhood_radius,
+        )
+        return build_series_sql(slice_, metric, start, end, extra_buckets=history_buckets)
+    return build_series_sql(slice_, metric, fetch_window_start(start, trailing_days), end)
+
+
 def _select_comparison(
     observations: Sequence[tuple[datetime, float | None]],
     bucket: datetime,
@@ -479,21 +515,20 @@ async def detect(
     """Fetch the series through the MCP gateway (one query) and detect anomaly windows
     over [start, end). This is the only function in this module that performs I/O.
 
-    Under WEEK_OVER_WEEK, the query fetches [start, end) in full plus exactly the
-    comparison-history buckets `required_history_buckets` says the baseline will read
-    -- not the whole contiguous range back to `lookback_weeks` ago (see the module
-    docstring). TRAILING_DAYS keeps fetching its full contiguous range unchanged.
+    How much history that one query fetches is `build_window_series_sql`'s decision,
+    not this function's -- see it and the module docstring.
     """
     metric = get_metric(metric_name)
-    if mode is ComparisonMode.WEEK_OVER_WEEK:
-        targets = _bucket_range(start, end)
-        history_buckets = required_history_buckets(
-            targets, lookback_weeks=lookback_weeks, radius=neighbourhood_radius
-        )
-        sql = build_series_sql(slice_, metric, start, end, extra_buckets=history_buckets)
-    else:
-        fetch_start = fetch_window_start(start, trailing_days)
-        sql = build_series_sql(slice_, metric, fetch_start, end)
+    sql = build_window_series_sql(
+        slice_,
+        metric,
+        start,
+        end,
+        mode=mode,
+        trailing_days=trailing_days,
+        lookback_weeks=lookback_weeks,
+        neighbourhood_radius=neighbourhood_radius,
+    )
     result = await gateway.query(sql)
     observations = [(_parse_bucket(row["bucket"]), row["value"]) for row in result.rows]
     return detect_from_series(

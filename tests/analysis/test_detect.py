@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 import pytest
 
 from continuity.analysis.baseline import (
+    DEFAULT_LOOKBACK_WEEKS,
+    DEFAULT_NEIGHBOURHOOD_RADIUS,
     Baseline,
     BaselineStatus,
     ComparisonMode,
@@ -34,6 +36,7 @@ from continuity.analysis.detect import (
     BucketLabel,
     BucketStatus,
     build_series_sql,
+    build_window_series_sql,
     detect_from_series,
     fetch_window_start,
     group_windows,
@@ -328,8 +331,13 @@ def test_detection_result_unknown_fraction_is_zero_for_an_empty_series_range_gua
     from continuity.analysis.detect import DetectionResult
 
     result = DetectionResult(
-        slice=Slice(), metric="rebuffer", windows=[], total_buckets=0, anomalous_buckets=0,
-        unknown_buckets=0, sql="SELECT 1",
+        slice=Slice(),
+        metric="rebuffer",
+        windows=[],
+        total_buckets=0,
+        anomalous_buckets=0,
+        unknown_buckets=0,
+        sql="SELECT 1",
     )
     assert result.unknown_fraction == 0.0
 
@@ -451,6 +459,61 @@ def test_build_series_sql_with_extra_buckets_for_raw_events_matches_on_the_five_
     )
     assert "toStartOfFiveMinute(event_time) IN ('2025-12-01 09:00:00')" in sql
     assert "title_id = 1" in sql
+
+
+# ---------------------------------------------------------------------------
+# build_window_series_sql: the one place that decides how much history to fetch.
+# ---------------------------------------------------------------------------
+
+
+def test_build_window_series_sql_under_week_over_week_restricts_the_history_fetch():
+    """The whole point of the shared helper: a caller that asks for a window's series
+    gets the restricted fetch, without having to know that week-over-week only reads a
+    handful of (weekday, time-of-day) slots. The contiguous range arm must cover the
+    test window ONLY -- history arrives as an explicit IN list."""
+    slice_ = Slice().refine("device_type", "roku")
+    sql = build_window_series_sql(
+        slice_,
+        get_metric("startup"),
+        datetime(2026, 2, 15, 8, 0),
+        datetime(2026, 2, 15, 14, 0),
+        mode=ComparisonMode.WEEK_OVER_WEEK,
+    )
+    assert "bucket IN (" in sql
+    assert "bucket >= '2026-02-15 08:00:00' AND bucket < '2026-02-15 14:00:00'" in sql
+    # The pre-fix shape: a single contiguous range reaching back a month. Never again.
+    assert "bucket >= '2026-01-18 00:00:00'" not in sql
+
+
+def test_build_window_series_sql_under_trailing_days_keeps_the_contiguous_range():
+    """TRAILING_DAYS has no narrow-slot structure to exploit -- it reads every bucket in
+    its trailing window, so restricting the fetch would break it. It must keep fetching
+    the full contiguous range."""
+    sql = build_window_series_sql(
+        Slice(),
+        get_metric("rebuffer"),
+        datetime(2026, 2, 15, 8, 0),
+        datetime(2026, 2, 15, 14, 0),
+        mode=ComparisonMode.TRAILING_DAYS,
+        trailing_days=7,
+    )
+    assert "IN (" not in sql
+    assert "bucket >= '2026-02-08 00:00:00' AND bucket < '2026-02-15 14:00:00'" in sql
+
+
+def test_build_window_series_sql_fetches_exactly_what_the_baseline_will_read():
+    """The anti-drift property: the fetched history set is `required_history_buckets`'s
+    output for the same targets, so the fetch restriction cannot fall out of step with
+    the selection logic the baseline applies to what comes back."""
+    start, end = datetime(2026, 2, 15, 8, 0), datetime(2026, 2, 15, 8, 15)
+    sql = build_window_series_sql(Slice(), get_metric("rebuffer"), start, end)
+    expected = required_history_buckets(
+        [start, start + timedelta(minutes=5), start + timedelta(minutes=10)],
+        lookback_weeks=DEFAULT_LOOKBACK_WEEKS,
+        radius=DEFAULT_NEIGHBOURHOOD_RADIUS,
+    )
+    for bucket in expected:
+        assert f"'{bucket.strftime('%Y-%m-%d %H:%M:%S')}'" in sql
 
 
 def test_build_series_sql_with_an_empty_extra_buckets_set_omits_the_in_clause():

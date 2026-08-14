@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 
+from continuity.analysis.baseline import DEFAULT_LOOKBACK_WEEKS
 from continuity.analysis.cli import (
     IncidentInvestigation,
     InvestigationReport,
@@ -400,6 +401,29 @@ async def test_fetch_incident_series_issues_exactly_one_query():
     assert len(fake.queries) == 1
     assert result["sql"] == fake.queries[0]
     assert result["metric"] == "rebuffer"
+
+
+async def test_fetch_incident_series_does_not_fetch_the_whole_contiguous_history_range():
+    """The hero-chart query is the one remaining caller that fetched every bucket
+    between four weeks ago and the chart window -- ~8,500 tDigest-merged rows, of which
+    the week-over-week baseline reads about 15%. That is the exact query shape that hit
+    ClickHouse MEMORY_LIMIT_EXCEEDED during the agent/walker comparison, and it sits on
+    the live investigation path, so a demo would hit it too. History must arrive as the
+    explicit bucket list `required_history_buckets` enumerates, and the contiguous range
+    arm must cover the chart window only.
+    """
+    span = (_START, _START + timedelta(hours=1))
+    fake = _FakeSeriesGateway(rows=[])
+
+    await report_schema.fetch_incident_series(
+        fake, slice_=Slice(), metric_name="startup", span=span, padding=timedelta(0)
+    )
+
+    sql = fake.queries[0]
+    assert "bucket IN (" in sql
+    assert f"bucket >= '{_START.strftime('%Y-%m-%d %H:%M:%S')}'" in sql
+    four_weeks_back = (_START - timedelta(weeks=DEFAULT_LOOKBACK_WEEKS)).strftime("%Y-%m-%d")
+    assert f"bucket >= '{four_weeks_back} 00:00:00'" not in sql
 
 
 async def test_fetch_incident_series_marks_a_bucket_with_no_comparison_history_as_unknown():

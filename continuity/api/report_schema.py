@@ -9,22 +9,20 @@ the same separation `render_brief`'s own `_render_*` helpers would have used had
 this API existed first.
 
 The one piece of I/O this module owns (`fetch_incident_series`) reuses detect.py's
-public building blocks (`fetch_window_start`, `build_series_sql`, `label_buckets`)
-exactly as cli.py's `_typical_and_peak_deviation` already does -- `DetectionResult`
-itself only exposes anomaly windows and aggregate bucket counts, never every
-bucket's own baseline band, which the hero chart needs.
+public building blocks (`build_window_series_sql`, `label_buckets`) exactly as
+cli.py's `_typical_and_peak_deviation` already does -- `DetectionResult` itself only
+exposes anomaly windows and aggregate bucket counts, never every bucket's own
+baseline band, which the hero chart needs. Fetching through
+`build_window_series_sql` rather than assembling the range here is deliberate: this
+module previously decided its own history range and so kept the full-contiguous-month
+fetch after `detect()` had been fixed off it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from continuity.analysis.baseline import (
-    DEFAULT_LOOKBACK_WEEKS,
-    DEFAULT_TRAILING_DAYS,
-    BaselineStatus,
-    ComparisonMode,
-)
+from continuity.analysis.baseline import BaselineStatus
 from continuity.analysis.cli import (
     DEFAULT_REFINE_PADDING,
     IncidentInvestigation,
@@ -32,10 +30,8 @@ from continuity.analysis.cli import (
 )
 from continuity.analysis.correlate import DisconfirmingEvidence, RankedChange, RejectedChange
 from continuity.analysis.detect import (
-    DEFAULT_MODE,
     DEFAULT_THRESHOLD,
-    build_series_sql,
-    fetch_window_start,
+    build_window_series_sql,
     label_buckets,
 )
 from continuity.analysis.metrics import METRICS, get_metric
@@ -254,13 +250,7 @@ async def fetch_incident_series(
     metric = get_metric(metric_name)
     chart_start = span[0] - padding
     chart_end = span[1] + padding
-    days_of_history = (
-        DEFAULT_TRAILING_DAYS
-        if DEFAULT_MODE is ComparisonMode.TRAILING_DAYS
-        else DEFAULT_LOOKBACK_WEEKS * 7
-    )
-    fetch_start = fetch_window_start(chart_start, days_of_history)
-    sql = build_series_sql(slice_, metric, fetch_start, chart_end)
+    sql = build_window_series_sql(slice_, metric, chart_start, chart_end)
     result = await gateway.query(sql)
     observations = [(_parse_bucket_datetime(row["bucket"]), row["value"]) for row in result.rows]
     labels = label_buckets(observations, start=chart_start, end=chart_end, metric=metric)
