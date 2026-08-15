@@ -59,7 +59,14 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 EXPOSE 8080
 
-# Shell form on purpose: Cloud Run injects PORT and the exec form cannot expand it, so
-# an exec-form CMD with a hardcoded port silently fails to bind whenever the platform
-# assigns anything other than 8080. The default keeps `docker run` with no PORT working.
-CMD uvicorn continuity.api.app:app --host 0.0.0.0 --port "${PORT:-8080}"
+# Both halves of this matter and they pull against each other.
+#
+# Cloud Run injects PORT, and a plain exec-form CMD cannot expand it -- a hardcoded port
+# silently fails to bind whenever the platform assigns anything else. Plain shell form
+# fixes that but makes /bin/sh PID 1, so SIGTERM on shutdown goes to the shell and never
+# reaches uvicorn: no graceful drain, and the mcp-clickhouse subprocess the gateway owns
+# is killed rather than closed.
+#
+# `exec` gets both. The shell expands PORT, then replaces itself with uvicorn, so uvicorn
+# is PID 1 and receives signals directly.
+CMD ["/bin/sh", "-c", "exec uvicorn continuity.api.app:app --host 0.0.0.0 --port ${PORT:-8080}"]
