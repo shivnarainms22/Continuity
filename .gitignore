@@ -2,7 +2,12 @@
 __pycache__/
 *.pyc
 *.pyo
-.env
+# Every .env variant, not just `.env` itself. A bare `.env` rule leaves `.env.cloud`,
+# `.env.local-backup` and friends committable, which is exactly the file someone
+# creates while switching between a local and a hosted database. `.env.example` is
+# re-admitted below because it is deliberately tracked and holds no real values.
+.env*
+!.env.example
 .pytest_cache/
 .ruff_cache/
 node_modules/

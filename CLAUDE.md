@@ -156,5 +156,14 @@ uv run python -m continuity.data.load --days 56
 
 - Platform is Windows 11; the shell is PowerShell, with Git Bash also available.
 - Docker Desktop must be running before any integration test.
-- Fixed generation seed (`CONTINUITY_SEED`) keeps datasets reproducible. The eval harness depends
-  on regeneration being byte-identical — do not introduce unseeded randomness.
+- Fixed generation seed keeps datasets reproducible, and the eval harness depends on regeneration
+  being byte-identical — do not introduce unseeded randomness. The seed and dataset size live in
+  `continuity/data/load.py` (`DEFAULT_SEED = 20260908`, `DEFAULT_DAYS = 56`,
+  `DEFAULT_SESSIONS_PER_DAY = 250_000`), overridable per run with `--seed` / `--days` /
+  `--sessions-per-day`. They are NOT environment variables: `.env` once listed
+  `CONTINUITY_SEED` / `CONTINUITY_DAYS` / `CONTINUITY_SESSIONS_PER_DAY`, which nothing read, and
+  `CONTINUITY_DAYS` said 21 while every committed artefact came from 56 days.
+- **Every committed artefact assumes the 56-day dataset.** `data/ground_truth.json`,
+  `results/comparison.json`, the README head-to-head table and every integration test that derives
+  its window from ground truth. Reload with anything else and all of them silently stop agreeing
+  with the database.
