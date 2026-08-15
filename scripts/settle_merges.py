@@ -35,6 +35,44 @@ from continuity.config import ClickHouseConfig
 TABLES = ("playback_events", "qoe_rollup_5m")
 
 
+# ClickHouse's "background pool is already full" error. Not a failure: it means the
+# server is busy merging, which is the very thing this script is asking for.
+_CANNOT_ASSIGN_OPTIMIZE = "CANNOT_ASSIGN_OPTIMIZE"
+
+
+def _optimize_with_retry(client, table: str, partition: str, *, attempts: int = 6) -> None:
+    """Settle one partition, waiting out a saturated background pool.
+
+    Straight after a 63M-row load the merge pool is full, and ClickHouse Cloud rejects
+    OPTIMIZE outright rather than queueing it (code 388). That is transient by
+    definition -- the pool is full BECAUSE merges are running -- so the right response is
+    to wait, not to fail the run or to force it. Observed on Cloud: the pool cleared on
+    its own within a minute of the load finishing, leaving playback_events at 57 parts
+    for 56 daily partitions with nothing left to do.
+
+    Any other error is re-raised untouched. A script that swallowed real failures here
+    would report a settled dataset that is not settled, and the whole reason this exists
+    is that unsettled merges cause failures nobody can attribute.
+    """
+    delay = 10.0
+    for attempt in range(1, attempts + 1):
+        try:
+            client.command(
+                f"OPTIMIZE TABLE {table} PARTITION '{partition}' FINAL",
+                settings={"optimize_throw_if_noop": 0, "max_threads": 4},
+            )
+            return
+        except Exception as exc:
+            if _CANNOT_ASSIGN_OPTIMIZE not in str(exc) or attempt == attempts:
+                raise
+            print(
+                f"  merge pool full, waiting {delay:.0f}s before retry "
+                f"{attempt}/{attempts - 1} ({table} partition {partition})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
+
 def main() -> int:
     load_dotenv(override=False)
     config = ClickHouseConfig.from_env()
@@ -63,10 +101,7 @@ def main() -> int:
             for index, (partition, _parts) in enumerate(rows, start=1):
                 # One partition at a time keeps each merge's memory bounded. FINAL forces
                 # the merge now rather than leaving it to the background scheduler.
-                client.command(
-                    f"OPTIMIZE TABLE {table} PARTITION '{partition}' FINAL",
-                    settings={"optimize_throw_if_noop": 0, "max_threads": 4},
-                )
+                _optimize_with_retry(client, table, partition)
                 if index % 10 == 0 or index == len(rows):
                     print(
                         f"  {index}/{len(rows)} partitions settled "

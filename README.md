@@ -96,22 +96,23 @@ That makes the system measurable rather than merely demonstrable:
 | Attribution top-1 | ranked the true cause first |
 | Impact error | ARR-at-risk estimate vs. ground truth |
 
-### Dataset acceptance, verified on 59.8M events
+### Dataset acceptance, verified on 63.8M events in ClickHouse Cloud
 
 Before any agent work began, the dataset itself had to prove it can support the product.
 `scripts/acceptance_check.py` reads it the way an analyst would — through the MCP gateway,
-so it also exercises the runtime path at full scale:
+so it also exercises the runtime path at full scale. This run is against the deployed
+ClickHouse Cloud service (GCP `us-central1`, ClickHouse 26.2), not a laptop:
 
 ```
-Dataset: 59,802,205 events, 5,501,034 sessions, 3 change-log entries
+Dataset: 63,847,247 events, 5,897,702 sessions, 3 change-log entries
 
-  [+] INC-APP-ROKU-820   rebuffer 0.003748 inside vs 0.001171 control  (3.20x, planted 4.5x)
-  [+] INC-POP-NW-ATL-2   p95 startup 10,190ms vs 3,368ms control       (3.03x, planted 3.2x)
-  [+] INC-ENCODE-1       bitrate 1,127kbps vs 2,322kbps control        (0.49x, planted 0.45x)
-  [+] DECOY-PREMIERE-3   volume 3.6x, rebuffer 0.87x  -- a spike, not a fault
-  [+] naive threshold detector: 100% of alerts fall in 18:00-23:00
+  [+] INC-APP-ROKU-820   rebuffer 0.003894 inside vs 0.001142 control  (3.41x, planted 4.5x)
+  [+] INC-POP-NW-ATL-2   p95 startup 11,610ms vs 3,407ms control       (3.41x, planted 3.2x)
+  [+] INC-ENCODE-1       bitrate 1,171kbps vs 2,321kbps control        (0.50x, planted 0.45x)
+  [+] DECOY-PREMIERE-3   volume 5.2x, rebuffer 1.10x  -- a spike, not a fault
+  [+] naive threshold detector: 867 alerts, 100% fall in 18:00-23:00
   [+] no ClickHouse table contains incident ground truth
-6/6 checks passed
+6/6 checks passed          MCP queries executed: 44, slowest 2,088 ms
 ```
 
 Each incident is compared against **the same dimension slice at the same hours on other
