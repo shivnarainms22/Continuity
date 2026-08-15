@@ -6,22 +6,36 @@ An agentic incident-investigation system for streaming video. Continuity detects
 
 Built for the **Agentic Cinema** hackathon, ClickHouse track. Powered by Gemini on the Gemini Enterprise Agent Platform, with ClickHouse reached at runtime through the official `mcp-clickhouse` server.
 
-> Status: in development. Data foundation, deterministic analysis core, and the
-> Gemini agent pipeline are built and merged; the agent drives the product surface and
-> streams each measurement live. Remaining: deploy, and the head-to-head write-up below
-> kept in step with `results/comparison.json`.
->
-> Measured head-to-head on the planted incidents, zero errors in either arm
-> (`results/comparison.json`, reproduce with `uv run python scripts/compare_arms.py`):
->
-> | arm | exact blast radius | attribution | decoy ignored | cost |
-> |---|---|---|---|---|
-> | deterministic walker | 2/3 | 2/3 | 1/1 | $0, no model calls |
-> | Gemini agent | **3/3** | 2/3 | 1/1 | 655k tokens, 293s |
->
-> The agent wins on localisation; the arms tie on attribution. Both numbers are
-> reported because the walker is a genuinely strong baseline, and a comparison that
-> only showed the flattering half would not be worth running.
+### Live: https://continuity-609752596743.us-central1.run.app
+
+Cloud Run (`us-central1`) against ClickHouse Cloud (`us-central1`, ClickHouse 26.2),
+63.8M events. Pick an incident and watch the agent work — one frame per measurement,
+each expanding to the ClickHouse query behind it. A full investigation takes ~40s.
+
+**Head-to-head, measured on the deployed stack**, zero errors in either arm
+(`results/comparison_cloud.json`, reproduce with `uv run python scripts/compare_arms.py`):
+
+| arm | exact blast radius | attribution | decoy ignored | wall | cost |
+|---|---|---|---|---|---|
+| deterministic walker | 2/3 | 2/3 | 1/1 | 25–33s | $0, no model calls |
+| Gemini agent | **3/3** | 2/3 | 1/1 | 51–54s | 221k tokens |
+
+The agent wins on localisation and ties on attribution. Both are reported because the
+walker is a genuinely strong baseline and a comparison showing only the flattering half
+would not be worth running.
+
+Two things the table cannot say. The agent's win is `INC-ENCODE-1`, a per-title encode
+fault: the walker's drill-down excludes `title_id` by default, lands on
+`pop`/`app_version`/`cdn`, and understates revenue at risk by 87%. And on that same
+incident the agent could not corroborate a cause, **said so**, and marked its own impact
+figure unreliable rather than attaching the nearest plausible change — scoring zero for
+attribution, identically to the walker's confidently wrong answer. Those two failures are
+not equivalent and the scoring cannot see the difference.
+
+The cost gap also narrows on real infrastructure: locally the walker answered in ~5s
+against the agent's ~50s, but the walker issues ~79 queries per investigation and each
+one now pays a network round trip, so it lands at 25–33s. The agent is model-bound and
+barely moved.
 
 ---
 
