@@ -6,7 +6,22 @@ An agentic incident-investigation system for streaming video. Continuity detects
 
 Built for the **Agentic Cinema** hackathon, ClickHouse track. Powered by Gemini on the Gemini Enterprise Agent Platform, with ClickHouse reached at runtime through the official `mcp-clickhouse` server.
 
-> Status: in development. Sub-project 1 of 5 (data foundation).
+> Status: in development. Data foundation, deterministic analysis core, and the
+> Gemini agent pipeline are built and merged; the agent drives the product surface and
+> streams each measurement live. Remaining: deploy, and the head-to-head write-up below
+> kept in step with `results/comparison.json`.
+>
+> Measured head-to-head on the planted incidents, zero errors in either arm
+> (`results/comparison.json`, reproduce with `uv run python scripts/compare_arms.py`):
+>
+> | arm | exact blast radius | attribution | decoy ignored | cost |
+> |---|---|---|---|---|
+> | deterministic walker | 2/3 | 2/3 | 1/1 | $0, no model calls |
+> | Gemini agent | **3/3** | 2/3 | 1/1 | 655k tokens, 293s |
+>
+> The agent wins on localisation; the arms tie on attribution. Both numbers are
+> reported because the walker is a genuinely strong baseline, and a comparison that
+> only showed the flattering half would not be worth running.
 
 ---
 

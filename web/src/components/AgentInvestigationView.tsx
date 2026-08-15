@@ -3,12 +3,15 @@ import {
   formatDateRange,
   formatMs,
   formatMultiple,
+  formatUsd,
   formatZScore,
   humanizeBlastRadiusRecord,
   humanizeToolName,
   summarizeToolCall,
 } from '../lib/format'
 import type { AgentSliceDimension, AgentToolCallFrame, IncidentSummary } from '../types'
+import { AgentApprovalGate } from './AgentApprovalGate'
+import { ControlArmStrip } from './ControlArmStrip'
 import { Sql } from './Sql'
 
 /** The slice a tool call was asked about, as the agent phrased it. `slice_json` arrives
@@ -126,6 +129,13 @@ export function AgentInvestigationView({
         </section>
       )}
 
+      <ControlArmStrip
+        incidentId={incident.id}
+        agentSlice={investigation?.final_slice ?? null}
+        agentChangeId={correlation?.top_candidate_change_id ?? null}
+        agentElapsedMs={done?.total_elapsed_ms ?? null}
+      />
+
       <section className="mb-8">
         <h2 className="mb-4 text-xs font-semibold tracking-wide text-faint uppercase">
           What the agent measured
@@ -206,19 +216,24 @@ export function AgentInvestigationView({
               <div className="flex gap-3">
                 <dt className="w-32 shrink-0 text-faint">Impact</dt>
                 <dd className="text-fg">
-                  {quantify?.affected_subscribers.toLocaleString()} subscribers · $
-                  {quantify?.arr_at_risk_expected} ARR at risk
+                  {quantify?.affected_subscribers.toLocaleString()} subscribers ·{' '}
+                  {formatUsd(Number(quantify?.arr_at_risk_expected ?? 0))} ARR at risk
                   <span className="ml-2 text-muted">
-                    (${quantify?.arr_at_risk_low}–${quantify?.arr_at_risk_high})
+                    ({formatUsd(Number(quantify?.arr_at_risk_low ?? 0))}–
+                    {formatUsd(Number(quantify?.arr_at_risk_high ?? 0))})
                   </span>
                 </dd>
               </div>
-              <div className="flex gap-3">
-                <dt className="w-32 shrink-0 text-faint">Recommended</dt>
-                <dd className="text-fg">{brief?.recommended_action}</dd>
-              </div>
             </dl>
           </div>
+
+          {brief?.recommended_action && (
+            <AgentApprovalGate
+              recommendedAction={brief.recommended_action}
+              unresolved={brief.unresolved}
+              toolCalls={toolCalls}
+            />
+          )}
 
           {correlation?.disconfirming_evidence && (
             <div className="rounded border border-hairline bg-surface p-4">

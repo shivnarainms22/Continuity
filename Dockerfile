@@ -10,6 +10,18 @@
 # CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE, CLICKHOUSE_SECURE -- see
 # continuity/config.py::ClickHouseConfig.from_env), so the same image points at a local
 # `docker compose` ClickHouse or a Cloud ClickHouse instance without a rebuild.
+#
+# The agent path additionally needs GOOGLE_CLOUD_PROJECT, GOOGLE_GENAI_USE_ENTERPRISE=1,
+# GOOGLE_CLOUD_LOCATION=global (a region 404s for every Gemini 3.x model -- see
+# CLAUDE.md) and CONTINUITY_MODEL. Credentials come from the runtime service account via
+# ADC; no key material is ever baked into this image.
+#
+# Two things to get right when deploying to Cloud Run:
+#   * PORT is injected by the platform, so the server must bind whatever it is given
+#     rather than a hardcoded 8080 (see CMD below).
+#   * Startup spawns the mcp-clickhouse subprocess and its first connection, which costs
+#     ~20s. Give the service a startup probe with enough failureThreshold to cover that,
+#     or the first revision is killed before it ever becomes healthy.
 
 # ---- Stage 1: build the frontend --------------------------------------------------
 FROM node:23.6.1-slim AS frontend-builder
@@ -44,6 +56,10 @@ COPY --from=frontend-builder /app/web/dist ./web/dist
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
+ENV PORT=8080
 EXPOSE 8080
 
-CMD ["uvicorn", "continuity.api.app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Shell form on purpose: Cloud Run injects PORT and the exec form cannot expand it, so
+# an exec-form CMD with a hardcoded port silently fails to bind whenever the platform
+# assigns anything other than 8080. The default keeps `docker run` with no PORT working.
+CMD uvicorn continuity.api.app:app --host 0.0.0.0 --port "${PORT:-8080}"
