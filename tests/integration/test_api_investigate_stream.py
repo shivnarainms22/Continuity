@@ -72,7 +72,17 @@ def live_server() -> Iterator[httpx.Client]:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    client = httpx.Client(timeout=10.0)
+    # The READ timeout has to outlast the longest silent gap in the stream, which is the
+    # walk stage: ~5s against local Docker but 20.5s against ClickHouse Cloud, where each
+    # of the walker's ~79 queries pays a network round trip. At 10s this test failed on
+    # Cloud with httpcore.ReadTimeout and looked like broken streaming when the stream was
+    # fine -- it was the client giving up mid-gap.
+    #
+    # Deliberately generous rather than tuned to 20.5s: this test asserts that frames
+    # arrive INCREMENTALLY, and it should fail when they stop doing that, not when the
+    # database is further away than it used to be. The connect timeout stays short so a
+    # server that never comes up still fails fast.
+    client = httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0))
     deadline = time.time() + _READY_TIMEOUT_S
     last_error: Exception | None = None
     try:
