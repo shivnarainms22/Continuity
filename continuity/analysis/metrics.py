@@ -77,8 +77,7 @@ METRICS: dict[str, Metric] = {
         higher_is_worse=True,
         rollup_sql="sum(errors) / nullIf(sum(starts), 0)",
         raw_sql=(
-            "sum(toUInt64(event_type = 'error')) / "
-            "nullIf(sum(toUInt64(event_type = 'start')), 0)"
+            "sum(toUInt64(event_type = 'error')) / nullIf(sum(toUInt64(event_type = 'start')), 0)"
         ),
     ),
 }

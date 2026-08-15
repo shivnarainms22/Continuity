@@ -20,9 +20,9 @@ from continuity.analysis.baseline import (
 # ---------------------------------------------------------------------------
 
 
-def _series_at_same_time_of_day(day_offsets: list[int], hour: int = 21, minute: int = 0) -> list[
-    tuple[datetime, float]
-]:
+def _series_at_same_time_of_day(
+    day_offsets: list[int], hour: int = 21, minute: int = 0
+) -> list[tuple[datetime, float]]:
     """Build observations at `hour:minute` on `day_offsets` days before 2026-08-08."""
     target_day = datetime(2026, 8, 8, hour, minute)
     return [(target_day - timedelta(days=offset), float(10 + offset)) for offset in day_offsets]
@@ -239,7 +239,8 @@ def test_required_history_buckets_is_far_smaller_than_the_full_contiguous_range(
     the earliest comparison week and the test window -- not the ~30x-too-much range
     detect.py used to fetch."""
     targets = [
-        datetime(2026, 2, 14, 20, 0) + timedelta(minutes=5 * i) for i in range(216)  # 18h window
+        datetime(2026, 2, 14, 20, 0) + timedelta(minutes=5 * i)
+        for i in range(216)  # 18h window
     ]
     history = required_history_buckets(targets, lookback_weeks=4, radius=24)
 
@@ -592,9 +593,7 @@ def test_trailing_days_flags_legit_weekend_value_but_week_over_week_does_not():
     actual = 2525.0 + jitter_cycle[0]
 
     trailing_comparison = select_comparison_window(observations, target, trailing_days=7)
-    week_over_week_comparison = select_week_over_week_window(
-        observations, target, lookback_weeks=4
-    )
+    week_over_week_comparison = select_week_over_week_window(observations, target, lookback_weeks=4)
 
     trailing_baseline = compute_baseline(actual, trailing_comparison)
     week_over_week_baseline = compute_baseline(actual, week_over_week_comparison)

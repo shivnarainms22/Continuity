@@ -85,7 +85,11 @@ def real_tools() -> list[FunctionTool]:
 
 def _fake_clickhouse_config() -> ClickHouseConfig:
     return ClickHouseConfig(
-        host="localhost", port=8123, user="default", password="x", database="continuity",
+        host="localhost",
+        port=8123,
+        user="default",
+        password="x",
+        database="continuity",
         secure=False,
     )
 
@@ -454,9 +458,9 @@ def test_no_write_capable_tool_exists_anywhere_in_the_pipelines_tool_surface(rea
     """The five analysis primitives plus the MCP escape hatch are the entire tool
     surface this project's agents can ever be given -- none of them may write."""
     write_verbs = ("insert", "write", "delete", "update", "alter", "drop", "create")
-    tool_names = [t.name for t in real_tools] + list(build_readonly_mcp_toolset(
-        _fake_clickhouse_config()
-    ).tool_filter)
+    tool_names = [t.name for t in real_tools] + list(
+        build_readonly_mcp_toolset(_fake_clickhouse_config()).tool_filter
+    )
 
     assert not any(verb in name.lower() for name in tool_names for verb in write_verbs)
 
@@ -468,7 +472,9 @@ def test_no_write_capable_tool_exists_anywhere_in_the_pipelines_tool_surface(rea
 
 def test_correlation_result_requires_disconfirming_evidence_field():
     payload = dict(
-        candidates=[], confidence="high", reasoning="x",
+        candidates=[],
+        confidence="high",
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -478,7 +484,9 @@ def test_correlation_result_requires_disconfirming_evidence_field():
 
 def test_correlation_result_requires_confidence_field():
     payload = dict(
-        candidates=[], disconfirming_evidence="none returned", reasoning="x",
+        candidates=[],
+        disconfirming_evidence="none returned",
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -488,8 +496,11 @@ def test_correlation_result_requires_confidence_field():
 
 def test_correlation_result_requires_corroborated_field():
     payload = dict(
-        candidates=[], disconfirming_evidence="none returned", confidence="low",
-        reasoning="x", source={"tool_name": "find_changes", "audit_index": 0},
+        candidates=[],
+        disconfirming_evidence="none returned",
+        confidence="low",
+        reasoning="x",
+        source={"tool_name": "find_changes", "audit_index": 0},
     )
 
     with pytest.raises(pydantic.ValidationError, match="corroborated"):
@@ -501,8 +512,11 @@ def test_correlation_result_rejects_high_confidence_with_zero_candidates():
     AGAINST the blast radius, so high confidence must be structurally unrepresentable
     when there is nothing to corroborate with."""
     payload = dict(
-        candidates=[], disconfirming_evidence="nothing in change_log near onset",
-        confidence="high", corroborated=False, reasoning="x",
+        candidates=[],
+        disconfirming_evidence="nothing in change_log near onset",
+        confidence="high",
+        corroborated=False,
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -512,8 +526,11 @@ def test_correlation_result_rejects_high_confidence_with_zero_candidates():
 
 def test_correlation_result_rejects_corroborated_true_with_zero_candidates():
     payload = dict(
-        candidates=[], disconfirming_evidence="nothing in change_log near onset",
-        confidence="low", corroborated=True, reasoning="x",
+        candidates=[],
+        disconfirming_evidence="nothing in change_log near onset",
+        confidence="low",
+        corroborated=True,
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -532,7 +549,9 @@ def test_correlation_result_rejects_high_confidence_when_not_corroborated_even_w
             }
         ],
         disconfirming_evidence="the only candidate is not still_plausible",
-        confidence="high", corroborated=False, reasoning="x",
+        confidence="high",
+        corroborated=False,
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -543,8 +562,11 @@ def test_correlation_result_rejects_high_confidence_when_not_corroborated_even_w
 def test_correlation_result_accepts_low_confidence_with_zero_candidates_and_not_corroborated():
     """The honest, unresolved answer must remain representable."""
     payload = dict(
-        candidates=[], disconfirming_evidence="nothing in change_log near onset",
-        confidence="low", corroborated=False, reasoning="x",
+        candidates=[],
+        disconfirming_evidence="nothing in change_log near onset",
+        confidence="low",
+        corroborated=False,
+        reasoning="x",
         source={"tool_name": "find_changes", "audit_index": 0},
     )
 
@@ -576,9 +598,7 @@ def test_claim_reference_rejects_a_tool_name_that_does_not_exist():
 
 def test_act_proposal_cannot_be_constructed_with_requires_human_approval_false():
     with pytest.raises(pydantic.ValidationError):
-        ActProposal(
-            proposed_action="a", rationale="b", requires_human_approval=False
-        )
+        ActProposal(proposed_action="a", rationale="b", requires_human_approval=False)
 
 
 def test_act_proposal_cannot_be_constructed_as_already_executed():
@@ -967,9 +987,11 @@ def test_the_model_gets_a_query_reference_instead_of_the_sql_text():
     untouched -- and the model gets a marker naming where to find it.
     """
     audit_log = AuditLog()
-    big_sql = "SELECT bucket FROM qoe_rollup_5m WHERE bucket IN (" + ", ".join(
-        f"'2026-02-{d:02d} 12:00:00'" for d in range(1, 29)
-    ) + ")"
+    big_sql = (
+        "SELECT bucket FROM qoe_rollup_5m WHERE bucket IN ("
+        + ", ".join(f"'2026-02-{d:02d} 12:00:00'" for d in range(1, 29))
+        + ")"
+    )
     result = {
         "windows": [{"peak_z": 8.1}],
         "sql": big_sql,
@@ -978,8 +1000,10 @@ def test_the_model_gets_a_query_reference_instead_of_the_sql_text():
     }
 
     returned = audit_log.after_tool_callback(
-        tool=_FakeTool("detect_anomalies"), args={"metric": "rebuffer"},
-        tool_context=None, tool_response=result,
+        tool=_FakeTool("detect_anomalies"),
+        args={"metric": "rebuffer"},
+        tool_context=None,
+        tool_response=result,
     )
 
     blob = json.dumps(returned)
@@ -1009,13 +1033,17 @@ def test_an_observer_sees_each_tool_call_as_it_happens_not_at_the_end():
     audit_log = AuditLog(observer=lambda entry: seen.append((entry.tool_name, entry.sql)))
 
     audit_log.after_tool_callback(
-        tool=_FakeTool("split_all_dimensions"), args={}, tool_context=None,
+        tool=_FakeTool("split_all_dimensions"),
+        args={},
+        tool_context=None,
         tool_response={"splits": [], "sql": "SELECT split"},
     )
     assert seen == [("split_all_dimensions", "SELECT split")], "observer fired late or not at all"
 
     audit_log.after_tool_callback(
-        tool=_FakeTool("find_changes"), args={}, tool_context=None,
+        tool=_FakeTool("find_changes"),
+        args={},
+        tool_context=None,
         tool_response={"candidates": [], "sql": "SELECT changes"},
     )
     assert [name for name, _ in seen] == ["split_all_dimensions", "find_changes"]
@@ -1027,7 +1055,9 @@ def test_an_audit_log_with_no_observer_still_records():
     audit_log = AuditLog()
 
     audit_log.after_tool_callback(
-        tool=_FakeTool("measure_slice"), args={}, tool_context=None,
+        tool=_FakeTool("measure_slice"),
+        args={},
+        tool_context=None,
         tool_response={"value": 1, "sql": "SELECT 1"},
     )
 

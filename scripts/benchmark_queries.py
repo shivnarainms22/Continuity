@@ -80,43 +80,58 @@ async def main() -> int:
         await gw.query("SELECT 1")
 
         print("\n--- single-slice metric over the incident window ---")
-        results.append(await timed(
-            gw, "rollup: whole-population rebuffer, 8h window",
-            f"SELECT {REBUFFER} AS v FROM qoe_rollup_5m "
-            f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}'",
-        ))
-        results.append(await timed(
-            gw, "rollup: 2-dim slice rebuffer, 8h window",
-            f"SELECT {REBUFFER} AS v FROM qoe_rollup_5m "
-            f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}' "
-            "AND device_type = 'roku' AND app_version = '8.2.0'",
-        ))
-        results.append(await timed(
-            gw, "raw events: 2-dim slice rebuffer, 8h window",
-            f"SELECT {REBUFFER} AS v FROM playback_events "
-            f"WHERE event_time >= '{WINDOW[0]}' AND event_time < '{WINDOW[1]}' "
-            "AND device_type = 'roku' AND app_version = '8.2.0'",
-        ))
+        results.append(
+            await timed(
+                gw,
+                "rollup: whole-population rebuffer, 8h window",
+                f"SELECT {REBUFFER} AS v FROM qoe_rollup_5m "
+                f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}'",
+            )
+        )
+        results.append(
+            await timed(
+                gw,
+                "rollup: 2-dim slice rebuffer, 8h window",
+                f"SELECT {REBUFFER} AS v FROM qoe_rollup_5m "
+                f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}' "
+                "AND device_type = 'roku' AND app_version = '8.2.0'",
+            )
+        )
+        results.append(
+            await timed(
+                gw,
+                "raw events: 2-dim slice rebuffer, 8h window",
+                f"SELECT {REBUFFER} AS v FROM playback_events "
+                f"WHERE event_time >= '{WINDOW[0]}' AND event_time < '{WINDOW[1]}' "
+                "AND device_type = 'roku' AND app_version = '8.2.0'",
+            )
+        )
 
         print("\n--- baseline: trailing 7 days, same time of day ---")
-        results.append(await timed(
-            gw, "rollup: 7-day trailing per-bucket series",
-            "SELECT toStartOfFiveMinute(bucket) AS b, "
-            f"{REBUFFER} AS v FROM qoe_rollup_5m "
-            "WHERE bucket >= '2026-01-06 18:00:00' AND bucket < '2026-01-13 18:00:00' "
-            "GROUP BY b ORDER BY b",
-        ))
+        results.append(
+            await timed(
+                gw,
+                "rollup: 7-day trailing per-bucket series",
+                "SELECT toStartOfFiveMinute(bucket) AS b, "
+                f"{REBUFFER} AS v FROM qoe_rollup_5m "
+                "WHERE bucket >= '2026-01-06 18:00:00' AND bucket < '2026-01-13 18:00:00' "
+                "GROUP BY b ORDER BY b",
+            )
+        )
 
         print("\n--- one split per dimension (the naive walker: 1 query per dim per level) ---")
         for dim in ROLLUP_DIMS:
-            results.append(await timed(
-                gw, f"split on {dim}",
-                f"SELECT {dim} AS value, {REBUFFER} AS v, sum(watched_ms) AS w "
-                "FROM qoe_rollup_5m "
-                f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}' "
-                f"GROUP BY {dim} ORDER BY w DESC",
-                repeats=2,
-            ))
+            results.append(
+                await timed(
+                    gw,
+                    f"split on {dim}",
+                    f"SELECT {dim} AS value, {REBUFFER} AS v, sum(watched_ms) AS w "
+                    "FROM qoe_rollup_5m "
+                    f"WHERE bucket >= '{WINDOW[0]}' AND bucket < '{WINDOW[1]}' "
+                    f"GROUP BY {dim} ORDER BY w DESC",
+                    repeats=2,
+                )
+            )
 
         print("\n--- all dimensions in ONE query (the batched alternative) ---")
         union = " UNION ALL ".join(
@@ -128,14 +143,17 @@ async def main() -> int:
         results.append(await timed(gw, "batched: all dims in one UNION ALL", union, repeats=2))
 
         print("\n--- title-scoped (raw events, no rollup available) ---")
-        results.append(await timed(
-            gw, "raw: split on title_id, 8h window",
-            f"SELECT title_id AS value, {REBUFFER} AS v, sum(watched_ms) AS w "
-            "FROM playback_events "
-            f"WHERE event_time >= '{WINDOW[0]}' AND event_time < '{WINDOW[1]}' "
-            "GROUP BY title_id ORDER BY w DESC LIMIT 20",
-            repeats=2,
-        ))
+        results.append(
+            await timed(
+                gw,
+                "raw: split on title_id, 8h window",
+                f"SELECT title_id AS value, {REBUFFER} AS v, sum(watched_ms) AS w "
+                "FROM playback_events "
+                f"WHERE event_time >= '{WINDOW[0]}' AND event_time < '{WINDOW[1]}' "
+                "GROUP BY title_id ORDER BY w DESC LIMIT 20",
+                repeats=2,
+            )
+        )
 
     print(f"\n{'=' * 78}")
     print(f"{'query':<52}{'median ms':>12}{'rows':>10}")

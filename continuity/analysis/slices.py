@@ -61,9 +61,7 @@ def _escape_string_literal(value: str) -> str:
 def _render_predicate(dimension: str, value: str) -> str:
     if dimension == TITLE_ID_DIMENSION:
         if not value.isdigit():
-            raise InvalidSliceError(
-                f"title_id must be a non-negative integer, got {value!r}."
-            )
+            raise InvalidSliceError(f"title_id must be a non-negative integer, got {value!r}.")
         return f"{dimension} = {value}"
     return f"{dimension} = '{_escape_string_literal(value)}'"
 

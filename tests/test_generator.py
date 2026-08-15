@@ -14,6 +14,12 @@ from continuity.data.generator import (
     generate,
 )
 from continuity.data.incidents import ChangeLogEntry, Effect, PlantedIncident
+from continuity.data.load import (
+    DEFAULT_SEED,
+    DEFAULT_SESSIONS_PER_DAY,
+    DEFAULT_SUBSCRIBER_COUNT,
+    DEFAULT_TITLE_COUNT,
+)
 
 WINDOW_START = datetime(2026, 8, 3, 0, 0, tzinfo=UTC)  # Monday
 SATURDAY_START = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)  # Saturday, same week
@@ -565,3 +571,52 @@ def test_change_log_rows_are_generated_from_incidents_with_a_change_entry():
 def test_change_log_rows_empty_when_no_incident_has_a_change():
     decoy = _decoy_incident(WINDOW_START, hours=5, title_id=999)
     assert change_log_rows((decoy,)) == []
+
+
+# --- generated volume is pinned to what every committed artefact assumes -------------
+
+
+def test_default_sessions_per_day_reproduces_the_dataset_the_artefacts_were_built_on():
+    """`DEFAULT_SESSIONS_PER_DAY` must keep producing the dataset that
+    data/ground_truth.json, results/comparison.json, the README head-to-head table and
+    every ground-truth-derived integration window were validated against.
+
+    This exists because the default silently said 250_000 while the database everything
+    was measured on held a 100k dataset. Nothing caught it: ground truth pins the seed,
+    the days and the planted predicates but not the session volume, so a reload at the
+    wrong scale reproduces the same incidents over 2.5x the traffic and every
+    predicate-based acceptance check still passes while every impact figure moves.
+
+    Day one is enough to pin it -- the generator draws per 5-minute bucket from a
+    bucket-derived seed, so a day's count is independent of how many days are requested,
+    and a wrong `sessions_per_day` shows up immediately.
+    """
+    window_start = datetime(2026, 1, 1, tzinfo=UTC)
+    seed_seq = np.random.SeedSequence(DEFAULT_SEED)
+    titles_seed, subscribers_seed = seed_seq.spawn(2)
+    titles = generate_titles(
+        np.random.default_rng(titles_seed), DEFAULT_TITLE_COUNT, as_of=window_start.date()
+    )
+    subscribers = generate_subscribers(
+        np.random.default_rng(subscribers_seed),
+        DEFAULT_SUBSCRIBER_COUNT,
+        as_of=window_start.date(),
+    )
+
+    sessions: set[int] = set()
+    for batch in generate(
+        seed=DEFAULT_SEED,
+        window_start=window_start,
+        days=1,
+        sessions_per_day=DEFAULT_SESSIONS_PER_DAY,
+        titles=titles,
+        subscribers=subscribers,
+    ):
+        sessions.update(batch["session_id"].tolist())
+
+    assert len(sessions) == 95_262, (
+        f"day one produced {len(sessions):,} sessions, not the 95,262 the loaded database "
+        "holds. Either DEFAULT_SESSIONS_PER_DAY changed, or the generator's draw changed. "
+        "Both invalidate every committed artefact until the database is reloaded and the "
+        "artefacts regenerated."
+    )

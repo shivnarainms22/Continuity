@@ -184,8 +184,7 @@ async def main() -> int:
     if result.quantify:
         q = result.quantify
         print(
-            f"\nIMPACT         subscribers {q.affected_subscribers:,}  "
-            f"ARR {q.arr_at_risk_expected}"
+            f"\nIMPACT         subscribers {q.affected_subscribers:,}  ARR {q.arr_at_risk_expected}"
         )
 
     if result.brief:

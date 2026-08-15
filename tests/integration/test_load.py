@@ -73,8 +73,12 @@ def _working_database_must_be_untouched():
 
     def count() -> int | None:
         client = clickhouse_connect.get_client(
-            host=working.host, port=working.port, username=working.user,
-            password=working.password, database=working.database, secure=working.secure,
+            host=working.host,
+            port=working.port,
+            username=working.user,
+            password=working.password,
+            database=working.database,
+            secure=working.secure,
         )
         try:
             return int(client.query("SELECT count() FROM playback_events").result_rows[0][0])
@@ -328,8 +332,12 @@ def test_partial_playback_events_insert_failure_raises_with_progress_context(
 
 def test_bad_config_fails_loudly_instead_of_reporting_success(tmp_path):
     bad_config = ClickHouseConfig(
-        host="localhost", port=8123, user="default", password="not-the-real-password",
-        database="continuity", secure=False,
+        host="localhost",
+        port=8123,
+        user="default",
+        password="not-the-real-password",
+        database="continuity",
+        secure=False,
     )
     with pytest.raises(load_module.LoadError):
         _run(bad_config, tmp_path / "ground_truth.json")

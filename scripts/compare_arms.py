@@ -868,8 +868,7 @@ async def main() -> int:
     parser.add_argument(
         "--incidents",
         default=None,
-        help="Comma-separated incident ids to run (default: every incident in "
-        "ground_truth.json).",
+        help="Comma-separated incident ids to run (default: every incident in ground_truth.json).",
     )
     parser.add_argument(
         "--pace-seconds",

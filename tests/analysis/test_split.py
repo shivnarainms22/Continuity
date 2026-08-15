@@ -63,7 +63,7 @@ def test_naive_ranking_by_raw_deviation_would_wrongly_promote_the_tiny_slice():
     measurements = _large_vs_tiny_measurements()
 
     naive_ranking = sorted(
-        measurements, key=lambda m: (m.metric_value - m.baseline_value), reverse=True
+        measurements, key=lambda m: m.metric_value - m.baseline_value, reverse=True
     )
     assert naive_ranking[0].value == "tiny"  # the bug: naive ranking gets this backwards
 
@@ -81,9 +81,7 @@ def test_naive_ranking_by_raw_deviation_would_wrongly_promote_the_tiny_slice():
 
 def test_bitrate_drop_is_ranked_as_a_positive_contribution_not_an_improvement():
     measurements = [
-        ValueMeasurement(
-            value="dropped", metric_value=3000.0, baseline_value=5000.0, weight=100.0
-        ),
+        ValueMeasurement(value="dropped", metric_value=3000.0, baseline_value=5000.0, weight=100.0),
         ValueMeasurement(
             value="improved", metric_value=6000.0, baseline_value=5000.0, weight=100.0
         ),

@@ -103,7 +103,7 @@ async def test_walk_completes_quickly_enough_for_a_live_demo(gateway):
 
 
 async def test_walk_records_a_stop_reason_on_every_result(gateway):
-    """"Why did it stop here" must always be answerable, whatever the outcome."""
+    """ "Why did it stop here" must always be answerable, whatever the outcome."""
     incident = _by_kind("device_app_fault")
     window = _window(incident)
 

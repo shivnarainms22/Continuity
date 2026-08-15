@@ -130,6 +130,16 @@ uv run python -m continuity.data.load --days 56
 - **TDD.** Failing test first, then minimal implementation. Tests are named for behaviour, not
   implementation.
 - **Never work on `main`.** Branch per sub-project: `feat/data-foundation`, `feat/analysis-core`, …
+- **Trivial private helpers are duplicated per module on purpose; nothing else is.** `_fmt`,
+  `_parse_bucket_datetime`, `_validate_window` and `_sse` each exist in several modules. That is a
+  decision, not drift: they are one to four pure lines with no branching, and a shared
+  `utils.py` for them would couple `analysis`, `agent` and `api` through a grab-bag that exists
+  only to save four lines. Anything with real logic — a metric definition, a SQL builder, a
+  baseline rule — gets exactly one home and every caller imports it (see
+  `detect.build_window_series_sql`, which was consolidated precisely because four call sites had
+  each grown their own copy of a decision that mattered). The test of which side a helper falls
+  on: if two copies silently disagreeing would change a number the product reports, it is not
+  trivial and it does not get duplicated.
 - **Pure logic stays pure.** `seasonality.py`, `topology.py`, `incidents.py` have no I/O so the
   subtle logic is testable without Docker. Keep it that way.
 - **Errors are never swallowed.** A failed query must raise, never degrade into an empty result.

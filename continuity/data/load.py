@@ -45,7 +45,15 @@ WINDOW_START = datetime(2026, 1, 1, tzinfo=UTC)
 # continuity.data.incidents.build_incidents, which anchors incident placement to the
 # END of the window for exactly this reason). --days remains configurable.
 DEFAULT_DAYS = 56
-DEFAULT_SESSIONS_PER_DAY = 250_000
+# 100k, not the 250k this used to say. Every committed artefact -- data/ground_truth.json,
+# results/comparison.json, the README head-to-head, and every integration test that derives
+# its window from ground truth -- was produced from a 100k dataset. The 250k default agreed
+# with nothing and was caught only by comparing row counts after a load: at 250k the
+# generator produces 237,771 sessions on day one against the 95,262 the database actually
+# holds. A default that contradicts every artefact built from it is worse than no default,
+# because it silently rebuilds the world at the wrong scale and every predicate-based
+# acceptance check still passes.
+DEFAULT_SESSIONS_PER_DAY = 100_000
 DEFAULT_SEED = 20260908
 DEFAULT_BATCH_SIZE = 50_000
 DEFAULT_TITLE_COUNT = 500
@@ -363,9 +371,7 @@ def run_load(
         client.close()
 
     elapsed_s = time.perf_counter() - started
-    progress(
-        f"done in {elapsed_s:.1f}s: " + ", ".join(f"{t}={n}" for t, n in row_counts.items())
-    )
+    progress(f"done in {elapsed_s:.1f}s: " + ", ".join(f"{t}={n}" for t, n in row_counts.items()))
     return LoadReport(
         row_counts=row_counts, elapsed_s=elapsed_s, ground_truth_path=ground_truth_path
     )

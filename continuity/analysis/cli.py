@@ -141,8 +141,7 @@ _STOP_REASON_TEXT: dict[StopReason, str] = {
         "big, not causal"
     ),
     StopReason.LOW_SHARE: (
-        "no remaining dimension explained enough of the deviation to justify "
-        "descending further"
+        "no remaining dimension explained enough of the deviation to justify descending further"
     ),
     StopReason.SINGLE_VALUE: (
         "every remaining dimension had only one usable value -- nothing left to compare"
@@ -1035,9 +1034,7 @@ def investigate(
     start: str | None = typer.Option(
         None, "--start", help="Window start, e.g. '2026-02-12 12:00:00'."
     ),
-    end: str | None = typer.Option(
-        None, "--end", help="Window end, e.g. '2026-02-13 06:00:00'."
-    ),
+    end: str | None = typer.Option(None, "--end", help="Window end, e.g. '2026-02-13 06:00:00'."),
     incident: str | None = typer.Option(
         None, "--incident", help="Incident id from ground truth, e.g. INC-APP-ROKU-820."
     ),
@@ -1076,9 +1073,7 @@ def investigate(
         )
         get_metric(metric_name)
         if merge_gap_hours < 0:
-            raise InvestigationInputError(
-                f"--merge-gap-hours must be >= 0, got {merge_gap_hours}"
-            )
+            raise InvestigationInputError(f"--merge-gap-hours must be >= 0, got {merge_gap_hours}")
         if refine_padding_hours < 0:
             raise InvestigationInputError(
                 f"--refine-padding-hours must be >= 0, got {refine_padding_hours}"

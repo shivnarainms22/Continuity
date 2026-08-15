@@ -627,9 +627,7 @@ def select_tools(tools: Sequence[FunctionTool], names: Sequence[str]) -> list[Fu
     by_name = {tool.name: tool for tool in tools}
     missing = [name for name in names if name not in by_name]
     if missing:
-        raise KeyError(
-            f"Tool(s) {missing} not found among available tools {sorted(by_name)}."
-        )
+        raise KeyError(f"Tool(s) {missing} not found among available tools {sorted(by_name)}.")
     return [by_name[name] for name in names]
 
 

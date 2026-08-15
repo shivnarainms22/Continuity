@@ -464,9 +464,7 @@ async def split_dimensions(
 
     results: dict[str, SplitResult] = {}
     for dimension in dimensions:
-        measurements = _rows_to_measurements(
-            window_by_dim[dimension], baseline_by_dim[dimension]
-        )
+        measurements = _rows_to_measurements(window_by_dim[dimension], baseline_by_dim[dimension])
         values = rank_contributions(
             measurements,
             dimension=dimension,

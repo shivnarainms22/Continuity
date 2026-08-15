@@ -666,8 +666,7 @@ class AnalysisTools:
         result = results[dimension]
         if not result.values:
             return _error(
-                f"no data for dimension {dimension!r} in the window "
-                f"{window_start}..{window_end}",
+                f"no data for dimension {dimension!r} in the window {window_start}..{window_end}",
                 "no_data",
             )
 
@@ -833,9 +832,7 @@ class AnalysisTools:
                     "lift": top_lift,
                     "meets_lift_gate": _meets_lift_gate(top_lift),
                     "note": (
-                        top.note
-                        if top is not None
-                        else "no data for this dimension in the window"
+                        top.note if top is not None else "no data for this dimension in the window"
                     ),
                 }
             )
