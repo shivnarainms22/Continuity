@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from google.adk.runners import InMemoryRunner
@@ -46,6 +47,56 @@ from continuity.analysis.slices import Slice
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway
 
 APP_NAME = "continuity-agent-stream"
+
+DEFAULT_AGENT_SLOTS = 2
+"""How many investigations may run at once on one instance.
+
+Two, because the resource being protected is singular: the gateway owns ONE
+mcp-clickhouse session, so concurrent investigations serialise on it regardless and
+only make each other slower. Two lets a second visitor start while the first is in a
+model round trip -- which is where an investigation spends essentially all of its time
+-- without letting a crawler on a public demo URL open twenty of them, each costing
+~90k Gemini tokens against a quota the demo depends on.
+"""
+
+
+class TooManyInvestigations(RuntimeError):
+    """Every investigation slot is busy. Raised rather than queued: a caller told
+    immediately can retry or watch the deterministic arm, whereas a queued request just
+    times out later alongside everything else waiting behind it."""
+
+
+class AgentSlots:
+    """A counting guard around concurrent investigations.
+
+    Not `asyncio.Semaphore`: a semaphore's `acquire` WAITS, which is precisely the
+    behaviour to avoid here. Requests that pile up waiting all fail together at the far
+    end, having held connections open for a minute first.
+    """
+
+    def __init__(self, limit: int = DEFAULT_AGENT_SLOTS) -> None:
+        self._limit = limit
+        self._in_use = 0
+
+    @property
+    def in_use(self) -> int:
+        return self._in_use
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[None]:
+        if self._in_use >= self._limit:
+            raise TooManyInvestigations(
+                f"{self._in_use} of {self._limit} investigation slots are busy. "
+                "Try again shortly, or run the deterministic arm, which is free."
+            )
+        self._in_use += 1
+        try:
+            yield
+        finally:
+            # Released in `finally` on purpose: a failed investigation that kept its slot
+            # would wedge the demo closed until the instance restarted.
+            self._in_use -= 1
+
 
 _STAGE_LABELS = {
     "investigate": "Isolating the blast radius",

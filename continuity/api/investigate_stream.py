@@ -47,7 +47,11 @@ from continuity.analysis.impact import compute_impact
 from continuity.analysis.slices import Slice
 from continuity.analysis.walk import WalkResult
 from continuity.analysis.walk import walk as run_walk
-from continuity.api.agent_stream import stream_agent_investigation
+from continuity.api.agent_stream import (
+    AgentSlots,
+    TooManyInvestigations,
+    stream_agent_investigation,
+)
 from continuity.api.report_schema import (
     fetch_incident_series,
     iso,
@@ -57,6 +61,11 @@ from continuity.api.report_schema import (
 from continuity.gateway.mcp_gateway import ClickHouseMCPGateway, QueryError
 
 router = APIRouter(prefix="/api/investigate")
+
+# Used when the app did not set one (tests constructing the router directly). Production
+# wiring puts a shared instance on app.state so every request on an instance counts
+# against the same budget -- a per-request guard would count nothing.
+_FALLBACK_SLOTS = AgentSlots()
 
 
 def _sse(event: str, data: dict) -> str:
@@ -274,17 +283,27 @@ async def agent_investigate_stream(incident_id: str, request: Request) -> Stream
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     model = getattr(request.app.state, "agent_model", DEFAULT_MODEL_ID)
+    slots: AgentSlots = getattr(request.app.state, "agent_slots", None) or _FALLBACK_SLOTS
 
     async def event_source() -> AsyncIterator[str]:
+        # The slot is taken INSIDE the generator, not before returning the response: the
+        # investigation only begins when the client starts consuming, and a slot held
+        # from before that would be charged to a request that never ran.
         try:
-            async for frame in stream_agent_investigation(
-                gateway,
-                metric_name=metric_name,
-                window=window,
-                description=description,
-                model=model,
-            ):
-                yield frame
+            async with slots.acquire():
+                async for frame in stream_agent_investigation(
+                    gateway,
+                    metric_name=metric_name,
+                    window=window,
+                    description=description,
+                    model=model,
+                ):
+                    yield frame
+        except TooManyInvestigations as exc:
+            # A 200 carrying an `error` frame, not an HTTP 429: the response has already
+            # begun streaming by the time this runs, so the status is long since sent.
+            # The UI shows the message; the deterministic arm is unaffected and free.
+            yield _sse("error", {"message": str(exc), "retryable": True})
         except QueryError as exc:
             yield _sse("error", {"message": str(exc)})
 

@@ -308,3 +308,45 @@ async def test_a_quiet_range_ends_the_stream_without_ever_calling_the_model(monk
 
     assert [name for name, _ in events] == ["done"]
     assert events[0][1]["detected"] is False
+
+
+# ---------------------------------------------------------------------------
+# Concurrency guard on the agent endpoint
+# ---------------------------------------------------------------------------
+
+
+async def test_the_agent_slot_limits_concurrent_investigations():
+    """A public demo URL must not let arbitrary traffic start unlimited investigations.
+
+    Each one costs ~90k Gemini tokens and, more immediately, the gateway holds ONE
+    mcp-clickhouse session, so simultaneous investigations serialise on it anyway and
+    just make each other slower. The guard turns that into an explicit, fast refusal
+    rather than a queue of requests all timing out together.
+
+    Deliberately a slot count rather than a per-IP rate limit: the resource being
+    protected is the single gateway session and the token budget, neither of which cares
+    which address asked.
+    """
+    slots = agent_stream.AgentSlots(limit=2)
+
+    async with slots.acquire(), slots.acquire():
+        assert slots.in_use == 2
+        with pytest.raises(agent_stream.TooManyInvestigations):
+            async with slots.acquire():
+                pass  # pragma: no cover - the acquire above must raise
+
+    assert slots.in_use == 0, "slots must be released even after a refusal"
+
+
+async def test_a_slot_is_released_when_an_investigation_fails():
+    """A crashed investigation must not permanently consume a slot -- three failures
+    would otherwise wedge the demo closed until the instance restarts."""
+    slots = agent_stream.AgentSlots(limit=1)
+
+    with pytest.raises(ValueError):
+        async with slots.acquire():
+            raise ValueError("investigation blew up")
+
+    assert slots.in_use == 0
+    async with slots.acquire():
+        assert slots.in_use == 1

@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from continuity.api.agent_stream import AgentSlots
 from continuity.api.ground_truth import (
     DEFAULT_GROUND_TRUTH_PATH,
     GroundTruthError,
@@ -47,6 +48,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async with ClickHouseMCPGateway(config) as gateway:
         app.state.gateway = gateway
         app.state.ground_truth_path = DEFAULT_GROUND_TRUTH_PATH
+        # One budget per instance, shared by every request. On a public demo URL this
+        # is what stops arbitrary traffic opening unbounded investigations, each
+        # costing ~90k Gemini tokens against the quota the demo itself depends on.
+        app.state.agent_slots = AgentSlots()
         yield
     app.state.gateway = None
 
