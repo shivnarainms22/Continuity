@@ -18,6 +18,15 @@ services:
         hard: 262144
     volumes:
       - ch_data:/var/lib/clickhouse
+      # Cache budgets sized for this container rather than for a large dedicated
+      # server -- see the file's own comment. Without it, ClickHouse's default caches
+      # are permitted 23+ GiB against a 5.97 GiB memory cap, and queries get stopped
+      # by OvercommitTracker at random once the caches fill.
+      - ./docker/clickhouse-caches.xml:/etc/clickhouse-server/config.d/caches.xml:ro
+      # A per-query ceiling, so a runaway query fails by itself instead of the server
+      # stopping an unrelated one. Goes in users.d, not config.d: max_memory_usage is a
+      # profile setting and is ignored entirely if placed in the server config.
+      - ./docker/clickhouse-query-limits.xml:/etc/clickhouse-server/users.d/query-limits.xml:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 5s

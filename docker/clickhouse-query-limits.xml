@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!--
+  A real per-query memory ceiling.
+
+  The server's TOTAL allowance is raised in caches.xml because ClickHouse's tracked total
+  over-counts by several GiB against actual resident memory. Raising it alone would leave
+  nothing bounding a single runaway query, so the bound is restored here where it belongs:
+  per query, enforced against that query's own usage.
+
+  2 GiB is roughly ten times the largest query this workload has ever issued (221 MiB,
+  measured across full suite runs), so it will not trip on legitimate work. When it does
+  trip, the offending query fails with MEMORY_LIMIT_EXCEEDED naming itself, rather than
+  the server stopping an unrelated bystander, which is the failure mode that made this
+  hard to diagnose in the first place.
+
+  NOTE for editors: XML forbids a double hyphen inside a comment, so the prose here
+  cannot use the double-hyphen dash the rest of this codebase does. A stray one makes
+  ClickHouse refuse to start with "Failed to merge config".
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <max_memory_usage>2147483648</max_memory_usage>
+        </default>
+    </profiles>
+</clickhouse>

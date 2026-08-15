@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<!--
+  Cache budgets sized for the container this actually runs in.
+
+  ClickHouse's defaults assume a large dedicated server: 8 GiB uncompressed cache, and
+  5 GiB each for the mark, primary-index, index-mark and vector-similarity caches. That
+  is 23+ GiB of permitted cache against a 6.6 GiB container whose max_server_memory_usage
+  is 5.97 GiB, i.e. roughly four times the total memory the server is allowed to use.
+
+  Caches count toward that total. So as a test run or a demo reads across many parts, the
+  caches fill, tracked memory walks up to the cap, and OvercommitTracker then stops
+  whichever query happens to be in flight. Measured: the killed queries were 20 to 60 MiB
+  bystanders, while the largest real query in a full suite run was 239 MiB and the largest
+  merge 5.89 MiB. Nothing that could account for a 5.97 GiB total on its own. That is what
+  made the failure look random and move between tests, and it is why restarting appeared
+  to fix it (empty caches) until they refilled.
+
+  The budgets below leave roughly 4.5 GiB of the cap for queries and merges, an order of
+  magnitude more headroom than this workload's measured peak.
+
+  uncompressed_cache_size is 0 deliberately rather than merely reduced: reads consult it
+  only when use_uncompressed_cache=1, which this project never sets, so on the default
+  read path it is pure budget with no benefit.
+
+  NOTE for editors: XML forbids a double hyphen inside a comment, so the prose here
+  cannot use the double-hyphen dash the rest of this codebase does. A stray one makes
+  ClickHouse refuse to start with "Failed to merge config".
+-->
+<clickhouse>
+    <!--
+      Total-memory allowance, raised deliberately and on evidence.
+
+      ClickHouse's tracked total runs far above what the server actually holds. Sampled
+      once a second across a full test run: tracked peaked at 5.77 GiB while resident
+      memory at that same instant was 1.71 GiB, with a single query in flight, and the
+      largest query anywhere in that window was 221 MiB (largest merge: 5.89 MiB).
+      Nothing real accounted for the total. Resident memory never exceeded 1.96 GiB.
+
+      The default cap is 0.9 * container RAM = 5.97 GiB, so that over-count reaches the
+      cap and OvercommitTracker stops whichever query happens to be in flight. The
+      victims were 20 to 60 MiB bystanders, which is why suite failures looked random
+      and moved between tests.
+
+      Raising the allowance to 12 GiB gives the over-count room without any real risk:
+      measured resident usage is ~2 GiB against a 6.6 GiB container. The protection this
+      would otherwise give up is restored properly below, as a PER-QUERY limit, so a
+      genuinely runaway query fails by itself and says so instead of the server picking
+      an unrelated victim.
+    -->
+    <max_server_memory_usage>12884901888</max_server_memory_usage>
+    <!--
+      The ratio must be raised alongside the absolute value. ClickHouse takes the MINIMUM
+      of max_server_memory_usage and max_server_memory_usage_to_ram_ratio * RAM, and this
+      image pins the ratio at 0.9, so setting the absolute value alone is silently
+      ineffective: system.server_settings still reported 5.97 GiB.
+    -->
+    <max_server_memory_usage_to_ram_ratio>2</max_server_memory_usage_to_ram_ratio>
+
+    <mark_cache_size>536870912</mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <primary_index_cache_size>268435456</primary_index_cache_size>
+    <index_mark_cache_size>268435456</index_mark_cache_size>
+    <index_uncompressed_cache_size>0</index_uncompressed_cache_size>
+    <vector_similarity_index_cache_size>0</vector_similarity_index_cache_size>
+</clickhouse>
