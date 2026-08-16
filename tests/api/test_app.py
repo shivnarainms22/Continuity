@@ -19,13 +19,40 @@ from continuity.api import app as app_module
 client = TestClient(app_module.app)
 
 
-def test_health_reports_ok_but_not_live_when_no_gateway_is_attached():
+def test_health_fails_the_probe_when_the_gateway_cannot_answer():
+    """A health endpoint that returns 200 while the database is unreachable is worse
+    than none: every probe, load balancer and uptime check believes it.
+
+    This was live. On a cold Cloud Run instance /api/health returned
+    {"status": "ok", "gateway_live": false} with HTTP 200 while the mcp-clickhouse
+    session was still connecting, so the platform saw a healthy instance and routed a
+    visitor to an app that could not answer a single question. It self-healed within
+    seconds, which is precisely what made it easy to miss.
+    """
     app_module.app.state.gateway = None
 
     response = client.get("/api/health")
 
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok", "gateway_live": False, "queries_run": 0}
+    assert response.status_code == 503, "an unreachable gateway must fail the probe"
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["gateway_live"] is False
+
+
+def test_health_reports_ok_when_the_gateway_answers():
+    class _LiveGateway:
+        query_log = [object(), object()]
+
+        async def query(self, sql):
+            return None
+
+    app_module.app.state.gateway = _LiveGateway()
+    try:
+        response = client.get("/api/health")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "gateway_live": True, "queries_run": 2}
+    finally:
+        app_module.app.state.gateway = None
 
 
 def test_incidents_reads_the_configured_ground_truth_file(tmp_path, monkeypatch):
