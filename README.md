@@ -15,13 +15,16 @@ each expanding to the ClickHouse query behind it. A full investigation takes **4
 The spread is Gemini latency on shared capacity, not query time -- ClickHouse accounts for
 0.2s of it. The range is quoted rather than the best number because a judge will time it.
 
-**Head-to-head, measured on the deployed stack**, zero errors in either arm
+**Head-to-head against the deployed database**, zero errors in either arm
 (`results/comparison_cloud.json`, reproduce with `uv run python scripts/compare_arms.py`):
 
-| arm | exact blast radius | attribution | decoy ignored | wall | cost |
-|---|---|---|---|---|---|
-| deterministic walker | 2/3 | 2/3 | 1/1 | 25–33s | $0, no model calls |
-| Gemini agent | **3/3** | 2/3 | 1/1 | 51–54s | 221k tokens |
+| arm | exact blast radius | attribution | decoy ignored | cost |
+|---|---|---|---|---|
+| deterministic walker | 2/3 | 2/3 | 1/1 | $0, no model calls |
+| Gemini agent | **3/3** | 2/3 | 1/1 | 221k tokens |
+
+Timings are reported separately below because they depend on where the client runs, and
+the accuracy figures do not.
 
 The agent wins on localisation and ties on attribution. Both are reported because the
 walker is a genuinely strong baseline and a comparison showing only the flattering half
@@ -35,10 +38,21 @@ figure unreliable rather than attaching the nearest plausible change — scoring
 attribution, identically to the walker's confidently wrong answer. Those two failures are
 not equivalent and the scoring cannot see the difference.
 
-The cost gap also narrows on real infrastructure: locally the walker answered in ~5s
-against the agent's ~50s, but the walker issues ~79 queries per investigation and each
-one now pays a network round trip, so it lands at 25–33s. The agent is model-bound and
-barely moved.
+**On speed, the walker wins clearly, and where you measure from changes the margin.**
+It issues ~79 queries per investigation, so its wall time is dominated by round trips to
+the database, while the agent is bound by model latency and barely moves:
+
+| measured from | walker | agent |
+|---|---|---|
+| deployed service (Cloud Run → ClickHouse Cloud, same region) | **9–11s** | 40–100s |
+| the comparison harness (laptop → ClickHouse Cloud) | 25–33s | 51–54s |
+| laptop → local Docker ClickHouse | ~5s | 45–56s |
+
+The deployed row is the one a visitor experiences, and there the agent is roughly 4–10x
+slower. An earlier draft of this README quoted only the middle row and concluded the gap
+narrows to ~1.7x on real infrastructure. That was measured with the client a long way from
+the database, which penalises the query-bound arm and flatters the model-bound one — the
+opposite of what happens on the deployment itself.
 
 ---
 
