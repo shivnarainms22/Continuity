@@ -29,5 +29,18 @@ data/*.csv
 data/*.log
 data/*.err
 
-# Demo recordings: regenerate with the script in docs/submission, do not bloat the repo
+# This machine's GLOBAL ignore (~/.config/git/ignore) contains `**/docs/`, which silently
+# excluded this project's entire docs tree from the repo: the design spec, ADR-001, all
+# four sub-project plans, SETUP.md, the screenshots and the submission copy. CLAUDE.md is
+# tracked and points at three of those paths, so a fresh clone contained references to
+# files it did not have, and no setup instructions at all.
+#
+# Re-including needs the DIRECTORY negated first -- git does not descend into an excluded
+# directory, so `!docs/**` alone would do nothing.
+!docs/
+!docs/**
+
+# Demo recordings: regenerate with docs/submission/record-demo.mjs. Listed AFTER the
+# docs negation above, because later rules win and it would otherwise be re-included.
 *.webm
+docs/submission/*.webm

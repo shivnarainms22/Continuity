@@ -1,0 +1,114 @@
+# 3-minute demo video — shot list and narration
+
+Hard limit is 3:00. This is budgeted to 2:52 so a slightly slow read still fits.
+
+**The one honesty constraint:** a real investigation takes 40–100s, which will not fit at
+1x. Where footage is sped up, put a visible `4x` badge on screen and leave the elapsed
+timer running. Judges forgive a time-lapse; they do not forgive a demo that implies an
+answer arrived faster than it did. Never cut from the start of a run to its result with no
+marker in between.
+
+Record against the live URL, not localhost, so the address bar shows it is deployed:
+https://continuity-609752596743.us-central1.run.app
+
+**Warm the instance first.** Load the page and run one throwaway investigation before
+recording, or the take begins with a ~35s cold start.
+
+---
+
+## 0:00–0:22 — The problem (22s)
+
+*Screen: the incident feed. Do not narrate the UI yet.*
+
+> A streaming service has millions of people watching at once. When video quality breaks
+> for some of them, the dashboard shows the spike immediately. That is not the hard part.
+>
+> The hard part is who is affected, what caused it, and whether it is worth acting on.
+> That takes a senior analyst three to five days — because it is not one query, it is a
+> chain of them, and each step depends on the answer to the last.
+
+## 0:22–0:35 — What you are looking at (13s)
+
+*Click into INC-APP-ROKU-820. Let the detect card land.*
+
+> This is Continuity. Sixty-four million playback events in ClickHouse Cloud. A rebuffer
+> spike has been detected across the whole audience — no model involved yet, that is pure
+> SQL. Now Gemini takes over.
+
+## 0:35–1:35 — The investigation, live (60s) — THE SHOT
+
+*Let the measurement trail build. Speed to 4x with the badge visible. Cursor follows each
+new row as it appears.*
+
+> Watch what it actually does.
+>
+> It splits the whole population and finds Roku explains four times more of the problem
+> than its size predicts. It splits again inside Roku — app version 8.2.0, near three
+> times. It checks whether anything deeper explains more. Nothing does, so it stops.
+>
+> Then it looks for a cause, and finds the 8.2.0 rollout three hours before onset.
+
+*Pause the speed-up. Expand one SQL disclosure. Hold for 4 seconds.*
+
+> Every one of those steps opens to the exact ClickHouse query behind it. The model never
+> sources a number — it decides what to investigate. The measuring is all SQL.
+
+## 1:35–2:00 — The brief, and the part that matters (25s)
+
+*Scroll to the brief. Land on the disconfirming-evidence panel, then the traced claims.*
+
+> Here is where it earns trust. 8.2.0 also shipped to three other device types, and none of
+> them degraded — so this is Roku-specific, not a bad release. The agent had to engage with
+> that evidence, not just find something that correlated.
+>
+> Three thousand six hundred subscribers, thirty-five thousand dollars of annual revenue at
+> risk. Every claim carries the measurement that produced it, checked mechanically.
+
+## 2:00–2:12 — Approval gate (12s)
+
+*Scroll to the gate. Click Approve. Let the confirmation render.*
+
+> And it stops here. The rollback is a proposal. Nothing acts without a human.
+
+## 2:12–2:45 — Why you should believe any of it (33s)
+
+*Cut to the control-arm panel, then to the README head-to-head table.*
+
+> One more thing, and it is the reason this is more than a demo.
+>
+> We built a second version that solves the same problem with pure statistics and no AI at
+> all, and ran both against incidents we planted ourselves, so we know the right answers.
+>
+> The agent found the exact affected group three times out of three. The statistical
+> version got two — it missed a fault affecting a single title, and understated the money
+> at risk by eighty-seven percent.
+>
+> And on that same incident the agent could not corroborate a cause. So it said so, and
+> marked its own estimate unreliable, rather than blaming the nearest plausible thing.
+
+## 2:45–2:52 — Close (7s)
+
+*Back to the live URL in the address bar.*
+
+> Continuity. It is deployed, the link is in the description, and every number it reports
+> can be traced back to the query that produced it.
+
+---
+
+## Shot checklist
+
+- [ ] Instance warmed (one throwaway run before recording)
+- [ ] Browser at 100% zoom, address bar visible showing the Cloud Run URL
+- [ ] `4x` badge on screen during every sped-up segment, elapsed timer visible
+- [ ] One SQL disclosure expanded and held long enough to read (4s minimum)
+- [ ] Disconfirming-evidence panel legible at full size
+- [ ] Approve button actually clicked, confirmation state shown
+- [ ] Control-arm panel visible with both arms answered
+- [ ] No terminal, no editor, no localhost anywhere in frame
+
+## If a take goes wrong
+
+The 429 risk is real: Vertex runs on shared capacity and can return `RESOURCE_EXHAUSTED`
+under load. The stream shows an error frame rather than dying silently. If it happens, wait
+a minute and re-record — do not edit around it, because the recovery is honest and the
+splice would not be.
