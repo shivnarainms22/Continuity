@@ -10,7 +10,10 @@ Built for the **Agentic Cinema** hackathon, ClickHouse track. Powered by Gemini 
 
 Cloud Run (`us-central1`) against ClickHouse Cloud (`us-central1`, ClickHouse 26.2),
 63.8M events. Pick an incident and watch the agent work — one frame per measurement,
-each expanding to the ClickHouse query behind it. A full investigation takes ~40s.
+each expanding to the ClickHouse query behind it. A full investigation takes **40-100s**
+(measured across runs: 40s best, ~65s typical on a warm instance, ~100s on a cold one).
+The spread is Gemini latency on shared capacity, not query time -- ClickHouse accounts for
+0.2s of it. The range is quoted rather than the best number because a judge will time it.
 
 **Head-to-head, measured on the deployed stack**, zero errors in either arm
 (`results/comparison_cloud.json`, reproduce with `uv run python scripts/compare_arms.py`):
@@ -74,15 +77,25 @@ DETECT → SCOPE → CORRELATE → QUANTIFY → BRIEF → [human approval] → A
 
 ```
 Browser ──► Continuity UI (React)
-              │ SSE — live stage-by-stage progress
+              │ SSE — one frame per MEASUREMENT, as the agent makes it
             FastAPI service (Cloud Run)
               │
-            ADK SequentialAgent — Gemini via Vertex AI
-              │ McpToolset
+            ADK Workflow graph — Gemini via Vertex AI (global endpoint)
+              │ FunctionTools (analysis primitives) + McpToolset
             mcp-clickhouse  (official ClickHouse MCP server)
               │ HTTPS
-            ClickHouse
+            ClickHouse Cloud
 ```
+
+`Workflow`, not the deprecated `SequentialAgent`: ADK 2.6.3 deprecates the latter and
+will remove it. The graph API also gives per-node retry, which is what absorbs Vertex's
+intermittent 429s from shared serving capacity.
+
+The stream is per tool call rather than per stage on purpose. The INVESTIGATE stage alone
+runs ~28s, so stage-level frames would leave a spinner for most of the run. Streaming each
+measurement turns the wait into the product's actual claim — you watch it form a
+hypothesis, split the population, read the lift, decide whether to descend, and stop —
+and it puts the ClickHouse query behind every step on screen while it runs.
 
 ### How ClickHouse is accessed, and why it differs by path
 
