@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,8 @@ from continuity.data.incidents import (
 )
 
 WINDOW_START = datetime(2026, 8, 1, tzinfo=UTC)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 DAYS = 56  # matches continuity.data.load.DEFAULT_DAYS: 4+ prior weeks per incident
 PREMIERE_TITLE_ID = 4001
 ENCODE_TITLE_ID = 4002
@@ -221,3 +224,39 @@ def test_ground_truth_json_contains_the_true_predicates(tmp_path, incidents):
     serialised_predicates = {row["incident_id"]: row["predicate"] for row in payload["incidents"]}
     for inc in incidents:
         assert serialised_predicates[inc.incident_id] == inc.predicate
+
+
+# --- ground truth drift guard -------------------------------------------------------
+
+
+def test_ground_truth_matches_the_committed_checksum():
+    """`data/ground_truth.json` is gitignored, so `git diff` on it can never report
+    drift -- it has no committed baseline to compare against.
+
+    That mattered: after loading ClickHouse Cloud, `git diff --quiet
+    data/ground_truth.json` was used as evidence that regeneration had matched the
+    committed parameters. It was silent, and it was always going to be silent, because
+    git has nothing to compare an untracked file to. A vacuous check that renders as a
+    pass is worse than no check.
+
+    The checksum in `data/ground_truth.sha256` IS committed, so this compares the file
+    against a real baseline. It fails when the seed, the day count, the session volume
+    or the generator's draw changes -- each of which silently invalidates
+    results/comparison.json, the README figures and every ground-truth-derived
+    integration window.
+    """
+    import hashlib
+
+    truth = PROJECT_ROOT / "data" / "ground_truth.json"
+    expected_file = PROJECT_ROOT / "data" / "ground_truth.sha256"
+    if not truth.exists():
+        pytest.skip("no ground_truth.json in this checkout; run the loader first")
+
+    expected = expected_file.read_text(encoding="utf-8").split()[0]
+    actual = hashlib.sha256(truth.read_bytes()).hexdigest()
+    assert actual == expected, (
+        "ground_truth.json no longer matches data/ground_truth.sha256.\n"
+        "Every committed artefact (results/comparison_cloud.json, the README head-to-head, "
+        "the integration windows) assumes the recorded ground truth. If this change is "
+        "intended, regenerate those artefacts and update the checksum in the same commit."
+    )

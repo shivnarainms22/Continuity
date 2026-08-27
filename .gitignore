@@ -28,3 +28,6 @@ data/*.parquet
 data/*.csv
 data/*.log
 data/*.err
+
+# Demo recordings: regenerate with the script in docs/submission, do not bloat the repo
+*.webm
