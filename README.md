@@ -7,6 +7,7 @@ An agentic incident-investigation system for streaming video. Continuity detects
 Built for the **Agentic Cinema** hackathon, ClickHouse track. Powered by Gemini on the Gemini Enterprise Agent Platform, with ClickHouse reached at runtime through the official `mcp-clickhouse` server.
 
 ### Live: https://continuity-609752596743.us-central1.run.app
+### Demo: https://youtu.be/xFN79wbc28M (2 min, real time, nothing sped up)
 
 Cloud Run (`us-central1`) against ClickHouse Cloud (`us-central1`, ClickHouse 26.2),
 63.8M events. Pick an incident and watch the agent work: one frame per measurement,

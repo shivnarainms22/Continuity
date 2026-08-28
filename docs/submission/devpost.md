@@ -195,14 +195,16 @@ fastapi, sse, react, typescript, tailwind, vite, google-cloud-run, docker, uv, p
 
 - Live demo: https://continuity-609752596743.us-central1.run.app
 - Source (MIT): https://github.com/shivnarainms22/Continuity
+- Video: https://youtu.be/xFN79wbc28M
 
 ---
 
 ## Notes for whoever fills in the form (not part of the submission)
 
 - Partner track: **ClickHouse**.
-- The demo video goes in Devpost's own video field, not in "Try it out". It must be public on
-  YouTube or Vimeo, in English, and under 3 minutes.
+- The demo video goes in Devpost's own video field, not in "Try it out":
+  https://youtu.be/xFN79wbc28M (uploaded 2026-08-28, Public, 2:01). The rules require it be
+  "made publicly visible" on YouTube or Vimeo, so Public and not Unlisted.
 - The elevator pitch field caps at 200 characters. The one above is 199, so it fits with one
   character to spare. If the form counts differently, drop "streaming " from "streaming video
   quality alert" to land at 189.
