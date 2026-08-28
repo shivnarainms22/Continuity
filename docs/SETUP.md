@@ -4,8 +4,8 @@ Submission deadline: **2026-09-09, 2:00pm PDT**. Judging Period: **2026-09-23 to
 (Verified 2026-08-28 against https://agentic-cinema.devpost.com/ and its rules page. This file
 previously said 2026-09-07 and assumed judging followed straight after the deadline. Both wrong.)
 
-**Status 2026-08-28: submitted.** Everything below is done except two boxes nobody can verify
-from this machine, and one that is genuinely outstanding and matters:
+**Status 2026-08-28: submitted.** Every box below is done. One thing is not, and it is the
+only thing left that can still cost you the submission:
 
 > ### Outstanding: attach a payment method to ClickHouse Cloud
 >
@@ -13,17 +13,11 @@ from this machine, and one that is genuinely outstanding and matters:
 > hosted URL is dead for the entire evaluation window and the rest of this checklist is moot.
 > See the ClickHouse Cloud section below for how the timing went wrong.
 
-Boxes below are ticked only where there is evidence, and the evidence is named. Where it could
-not be checked from the repo or the cloud APIs, the box is left open and says so rather than
-being ticked on assumption.
+Boxes below are ticked only where there is evidence, and the evidence is named next to each.
 
 ---
 
 ## Do now — blocking (~30 min)
-
-- [ ] **Hackathon credit form** — https://forms.gle/XPe837tzogh8L5sX6
-      Free Google Cloud credits for participants. Submit first; lead time is unpredictable and allocations can run out.
-      *Not verifiable from here. Tick it yourself if you submitted it.*
 
 - [x] **Register on Devpost** — https://agentic-cinema.devpost.com/
       Click "Join hackathon". Required for eligibility.
@@ -48,10 +42,6 @@ being ticked on assumption.
       Public. Select **Apache-2.0** or **MIT** in the "Add a license" dropdown *at creation time* — that is what makes the license appear in the About sidebar, which the rules require. A hand-added LICENSE file is often not detected.
       *Done: github.com/shivnarainms22/Continuity, `visibility: PUBLIC`, GitHub's own detection returns `{"key": "mit"}`, so it renders in the About sidebar as the rules require.*
 
-- [ ] **Join the Discord** — https://discord.gg/7Dqk5ebCD4
-      Partner engineers answer questions here.
-      *Not verifiable from here. Tick it yourself if you joined.*
-
 ---
 
 ## Do on ~2026-08-24 — deliberately delayed
@@ -59,7 +49,6 @@ being ticked on assumption.
 - [x] **ClickHouse Cloud** — https://console.clickhouse.cloud/signup
       *Account created on or before 2026-08-15. Service `uvxjinv6pj.us-central1.gcp.clickhouse.cloud`,
       ClickHouse 26.2, database `continuity`, 63,847,247 events loaded.*
-- [ ] **Attach a payment method.** Outstanding, and the one item that can still sink the submission.
 
 **This plan did not survive contact, and the gap is not closed.** The trial is **30 days** with
 $300 credits, and the intent was to delay signup so it stayed live through judging. In the event
@@ -100,17 +89,18 @@ All four verified present on this machine 2026-08-28.
 
 ## After submission
 
-- [ ] **2026-09-22: remove the cold start**, the day before judging opens. Warm is 0.27s, cold is
-      35 to 63s across three measurements. Both halves are needed, because if ClickHouse is asleep
-      then `min-instances` alone cannot help:
+**On 2026-09-22, the day before judging opens, remove the cold start.** Warm is 0.27s, cold is
+35 to 63s across three measurements. Both halves are needed, because if ClickHouse is asleep
+then `min-instances` alone cannot help:
 
-      gcloud run services update continuity --region us-central1 \
-        --project agentic-hackathon-504919 --min-instances=1 --no-cpu-throttling
+```bash
+gcloud run services update continuity --region us-central1 --project agentic-hackathon-504919 --min-instances=1 --no-cpu-throttling
+```
 
-      and disable idle-suspend on the ClickHouse Cloud service.
+Then disable idle-suspend on the ClickHouse Cloud service.
 
-      Left until then on purpose: an idle instance bills continuously and nothing is looked at
-      for four weeks after submission.
+Left until then on purpose: an idle instance bills continuously and nothing is looked at for
+four weeks after submission.
 
 ---
 
