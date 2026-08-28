@@ -1,7 +1,8 @@
 # Continuity — Master Decomposition
 
 **Spec:** `docs/superpowers/specs/2026-08-08-continuity-design.md`
-**Deadline:** 2026-09-07, 2:00pm PDT (30 days from start)
+**Deadline:** 2026-09-09, 2:00pm PDT. **Judging Period:** 2026-09-23 to 2026-10-07.
+(Corrected 2026-08-28; this plan was written against a 2026-09-07 deadline that was never right.)
 
 Five sub-projects. Each produces working, independently testable software. Each gets its own plan written *after* the previous one lands, so later plans are informed by real outcomes rather than guesses.
 
@@ -68,10 +69,11 @@ Planted incident truth is written to `data/ground_truth.json`, never to ClickHou
 
 | Date | Action | Why |
 |---|---|---|
-| 2026-08-24 | Create ClickHouse Cloud account | 30-day trial must still be live during post-deadline judging |
+| ~~2026-08-24~~ **actually 2026-08-15** | Create ClickHouse Cloud account | Intent was a trial still live during judging. Missed: signed up 9 days early, trial ends ~2026-09-14, judging starts 2026-09-23. Needs a card. |
 | 2026-08-31 | Feature freeze | A week for deploy, video, README, submission |
-| 2026-09-05 | Submit to Devpost | Never submit on deadline day |
-| 2026-09-07 14:00 PDT | Hard deadline | — |
+| ~~2026-09-05~~ **done 2026-08-28** | Submit to Devpost | Never submit on deadline day |
+| 2026-09-22 | Enable `--min-instances=1` and disable ClickHouse idle-suspend | Day before judging opens; earlier just bills an idle instance |
+| 2026-09-09 14:00 PDT | Hard deadline | Was recorded as 2026-09-07 until 2026-08-28 |
 
 ---
 

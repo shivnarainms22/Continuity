@@ -1,6 +1,8 @@
 # Setup Checklist — Continuity (Agentic Cinema Hackathon, ClickHouse track)
 
-Submission deadline: **2026-09-07, 2:00pm PDT**
+Submission deadline: **2026-09-09, 2:00pm PDT**. Judging Period: **2026-09-23 to 2026-10-07**.
+(Verified 2026-08-28 against https://agentic-cinema.devpost.com/ and its rules page. This file
+previously said 2026-09-07 and assumed judging followed straight after the deadline. Both wrong.)
 
 ---
 
@@ -37,7 +39,14 @@ Submission deadline: **2026-09-07, 2:00pm PDT**
 
 - [ ] **ClickHouse Cloud** — https://console.clickhouse.cloud/signup
 
-**Why delayed:** the trial is **30 days** with $300 credits. Signing up on Aug 8 expires it ~Sept 7 — the submission deadline — and judges test the hosted URL *after* that. Signing up Aug 24 covers judging through ~Sept 23.
+**This plan did not survive contact, and the gap is not closed.** The trial is **30 days** with
+$300 credits, and the intent was to delay signup so it stayed live through judging. In the event
+the account was created on or before **2026-08-15** (`results/comparison_cloud.json` is stamped
+that day), nine days earlier than planned, so the trial expires around **2026-09-14**. Judging
+does not begin until **2026-09-23**. The hosted demo is therefore dark for the whole judging
+window unless a payment method is attached to the ClickHouse Cloud account. Note that trial
+credits expire at day 30 even with a card attached, per ClickHouse's own docs, so the card is
+the question and not the credits.
 
 Until then, development runs against local Docker ClickHouse.
 

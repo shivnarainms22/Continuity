@@ -1,7 +1,9 @@
 # Continuity — Project Instructions
 
 Agentic incident investigation for streaming video quality of experience.
-Built for the Agentic Cinema hackathon, **ClickHouse track**. Deadline **2026-09-07, 2:00pm PDT**.
+Built for the Agentic Cinema hackathon, **ClickHouse track**. Deadline **2026-09-09, 2:00pm PDT**;
+**Judging Period 2026-09-23 to 2026-10-07**. Both confirmed against the rules page and the
+hackathon front page on 2026-08-28; earlier revisions of this file said 2026-09-07, which was wrong.
 
 - Design spec: `docs/superpowers/specs/2026-08-08-continuity-design.md`
 - Master plan: `docs/superpowers/plans/2026-08-08-continuity-master.md`
