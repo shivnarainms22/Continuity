@@ -43,4 +43,6 @@ data/*.err
 # Demo recordings: regenerate with docs/submission/record-demo.mjs. Listed AFTER the
 # docs negation above, because later rules win and it would otherwise be re-included.
 *.webm
+*.mp4
 docs/submission/*.webm
+docs/submission/*.mp4

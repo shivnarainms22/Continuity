@@ -1,0 +1,22 @@
+{
+  "_comment": "Narration for continuity-demo.webm, timed against the shot boundaries of the 2026-08-27 take. 'start' and 'budget' are seconds in that recording; they were measured from the video itself (caption-band change detection), not taken from record-demo.mjs intended timings, because the live investigation makes the real durations vary per take. Re-record the video and these must be re-measured.",
+  "source_video": "continuity-demo.webm",
+  "trim_to_seconds": 120.6,
+  "voice": "Charon",
+  "model": "gemini-2.5-pro-preview-tts",
+  "lines": [
+    {"id": "s01", "start": 2.9, "budget": 10.4, "text": "When streaming quality breaks for some of your viewers, the dashboard shows the spike. Working out who is affected and what it costs takes days."},
+    {"id": "s02", "start": 14.3, "budget": 7.8, "text": "Sixty four million playback events in ClickHouse Cloud. Detection here is pure SQL."},
+    {"id": "s05", "start": 22.4, "budget": 10.4, "text": "A deterministic control arm runs alongside the agent, with no model and no cost, so the two can be compared on the same incident."},
+    {"id": "s06", "start": 32.9, "budget": 3.6, "text": "Now Gemini takes over."},
+    {"id": "s07", "start": 36.7, "budget": 38.1, "text": "It splits the whole population, and finds Roku carries four times more of the problem than its size predicts. It splits again inside Roku, and app version eight point two point zero explains nearly three times its share. It goes one level deeper, finds nothing that explains more, and stops. Then it narrows the window and searches the change log for anything that shipped before the onset. Every measurement here is SQL against ClickHouse Cloud, in real time. None of it is sped up."},
+    {"id": "s08", "start": 74.9, "budget": 5.0, "text": "Every step opens the exact ClickHouse query behind it."},
+    {"id": "s09", "start": 80.0, "budget": 4.4, "text": "The model had to engage with evidence against its own conclusion."},
+    {"id": "s10", "start": 84.5, "budget": 4.5, "text": "Every claim traces to the measurement that produced it."},
+    {"id": "s11", "start": 89.1, "budget": 5.5, "text": "The rollback is only a proposal. Nothing acts without a human."},
+    {"id": "s12", "start": 94.8, "budget": 5.4, "text": "We measured this against a control arm. Pure statistics, no AI."},
+    {"id": "s13", "start": 100.3, "budget": 6.9, "text": "The agent found the exact affected slice three times out of three. The control arm got two."},
+    {"id": "s14", "start": 107.3, "budget": 6.9, "text": "There, it could not corroborate a cause. So it said so, and marked its own estimate unreliable."},
+    {"id": "s15", "start": 114.3, "budget": 6.3, "text": "Continuity is live. Every number traces back to the query that produced it."}
+  ]
+}
